@@ -1,0 +1,39 @@
+{
+  "jdt": {
+    "ls": {
+      "lombokSupport": {
+        "enabled": true
+      },
+      "java": {
+        "home": null
+      },
+      "configuration": {
+        "maven": {
+          "userSettings": null,
+          "updateBuildConfiguration": "interactive"
+        }
+      },
+      "completion": {
+        "enabled": true,
+        "guessMethodArguments": true,
+        "favoriteStaticMembers": [
+          "org.junit.jupiter.api.Assertions.*",
+          "org.mockito.Mockito.*"
+        ]
+      },
+      "codeGeneration": {
+        "generateComments": false,
+        "useBlocks": false
+      },
+      "autobuild": {
+        "enabled": true
+      }
+    }
+  },
+  "languages": {
+    "Java": {
+      "formatter": "language_server",
+      "enable_language_server": true
+    }
+  }
+}

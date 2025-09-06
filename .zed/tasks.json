@@ -1,0 +1,14 @@
+[
+  {
+    "label": "Run Spring Boot App",
+    "command": "mvn",
+    "args": ["spring-boot:run"],
+    "use_new_terminal": true
+  },
+  {
+    "label": "Build Project",
+    "command": "mvn",
+    "args": ["compile"],
+    "use_new_terminal": true
+  }
+]
