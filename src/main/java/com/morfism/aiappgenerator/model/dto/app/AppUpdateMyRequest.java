@@ -1,4 +1,4 @@
-package com.morfism.aiappgenerator.model.dto;
+package com.morfism.aiappgenerator.model.dto.app;
 
 import lombok.Data;
 

@@ -1,8 +1,6 @@
 package com.morfism.aiappgenerator.service;
 
-import cn.hutool.core.bean.BeanUtil;
-import cn.hutool.core.collection.CollUtil;
-import com.morfism.aiappgenerator.model.dto.UserQueryRequest;
+import com.morfism.aiappgenerator.model.dto.user.UserQueryRequest;
 import com.morfism.aiappgenerator.model.vo.LoginUserVO;
 import com.morfism.aiappgenerator.model.vo.UserVO;
 import com.mybatisflex.core.query.QueryWrapper;
@@ -10,9 +8,7 @@ import com.mybatisflex.core.service.IService;
 import com.morfism.aiappgenerator.model.entity.User;
 import jakarta.servlet.http.HttpServletRequest;
 
-import java.util.ArrayList;
 import java.util.List;
-import java.util.stream.Collectors;
 
 /**
  * user 服务层。

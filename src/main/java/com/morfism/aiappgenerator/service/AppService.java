@@ -1,6 +1,6 @@
 package com.morfism.aiappgenerator.service;
 
-import com.morfism.aiappgenerator.model.dto.AppQueryRequest;
+import com.morfism.aiappgenerator.model.dto.app.AppQueryRequest;
 import com.morfism.aiappgenerator.model.entity.App;
 import com.morfism.aiappgenerator.model.vo.AppVO;
 import com.mybatisflex.core.query.QueryWrapper;

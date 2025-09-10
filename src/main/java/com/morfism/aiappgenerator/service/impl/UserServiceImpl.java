@@ -5,7 +5,7 @@ import cn.hutool.core.collection.CollUtil;
 import cn.hutool.core.util.StrUtil;
 import com.morfism.aiappgenerator.exception.BusinessException;
 import com.morfism.aiappgenerator.exception.ErrorCode;
-import com.morfism.aiappgenerator.model.dto.UserQueryRequest;
+import com.morfism.aiappgenerator.model.dto.user.UserQueryRequest;
 import com.morfism.aiappgenerator.model.enums.UserRoleEnum;
 import com.morfism.aiappgenerator.model.vo.LoginUserVO;
 import com.morfism.aiappgenerator.model.vo.UserVO;
@@ -20,7 +20,6 @@ import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.stream.Collectors;
 
 import static com.morfism.aiappgenerator.constant.UserConstant.USER_LOGIN_STATE;
 

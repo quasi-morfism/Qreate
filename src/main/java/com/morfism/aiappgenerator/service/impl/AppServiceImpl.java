@@ -2,10 +2,9 @@ package com.morfism.aiappgenerator.service.impl;
 
 import cn.hutool.core.bean.BeanUtil;
 import cn.hutool.core.collection.CollUtil;
-import cn.hutool.core.util.StrUtil;
 import com.morfism.aiappgenerator.exception.BusinessException;
 import com.morfism.aiappgenerator.exception.ErrorCode;
-import com.morfism.aiappgenerator.model.dto.AppQueryRequest;
+import com.morfism.aiappgenerator.model.dto.app.AppQueryRequest;
 import com.morfism.aiappgenerator.model.entity.App;
 import com.morfism.aiappgenerator.model.entity.User;
 import com.morfism.aiappgenerator.mapper.AppMapper;
