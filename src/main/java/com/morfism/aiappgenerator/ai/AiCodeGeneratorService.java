@@ -41,4 +41,12 @@ public interface AiCodeGeneratorService {
     @SystemMessage(fromResource = "prompt/codegen-multi-file-system-prompt.txt")
     Flux<String> generateMultiFileCodeStream(String userMessage);
 
+    /**
+     * 生成应用名称
+     * @param initPrompt 初始化提示词
+     * @return 生成的应用名称
+     */
+    @SystemMessage(fromResource = "prompt/app-name-generation-system-prompt.txt")
+    String generateAppName(String initPrompt);
+
 }
