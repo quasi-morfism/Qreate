@@ -25,7 +25,7 @@ public class AiCodeGeneratorServiceFactory {
     private String provider;
 
     // OpenAI configuration
-    @Value("${ai.openai.api-key}")
+    @Value("${ai.openai.api-key:}")
     private String openaiApiKey;
 
     @Value("${ai.openai.base-url:https://api.openai.com/v1}")
@@ -47,7 +47,7 @@ public class AiCodeGeneratorServiceFactory {
     private Boolean openaiLogResponses;
 
     // Claude configuration
-    @Value("${ai.claude.api-key}")
+    @Value("${ai.claude.api-key:}")
     private String claudeApiKey;
 
     @Value("${ai.claude.model-name:claude-3-5-sonnet-20241022}")
@@ -66,7 +66,7 @@ public class AiCodeGeneratorServiceFactory {
     private Boolean claudeLogResponses;
 
     // Gemini configuration
-    @Value("${ai.gemini.api-key}")
+    @Value("${ai.gemini.api-key:}")
     private String geminiApiKey;
 
     @Value("${ai.gemini.model-name:gemini-1.5-flash}")
@@ -85,7 +85,7 @@ public class AiCodeGeneratorServiceFactory {
     private Boolean geminiLogResponses;
 
     // DeepSeek configuration (uses OpenAI API format)
-    @Value("${ai.deepseek.api-key}")
+    @Value("${ai.deepseek.api-key:}")
     private String deepseekApiKey;
 
     @Value("${ai.deepseek.base-url:https://api.deepseek.com/v1}")
