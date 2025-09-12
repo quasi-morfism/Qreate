@@ -2,21 +2,32 @@ package com.morfism.aiappgenerator.service.impl;
 
 import cn.hutool.core.bean.BeanUtil;
 import cn.hutool.core.collection.CollUtil;
+import cn.hutool.core.io.FileUtil;
+import cn.hutool.core.util.RandomUtil;
+import cn.hutool.core.util.StrUtil;
+import com.morfism.aiappgenerator.constant.AppConstant;
+import com.morfism.aiappgenerator.core.AiCodeGeneratorFacade;
 import com.morfism.aiappgenerator.exception.BusinessException;
 import com.morfism.aiappgenerator.exception.ErrorCode;
+import com.morfism.aiappgenerator.exception.ThrowUtils;
 import com.morfism.aiappgenerator.model.dto.app.AppQueryRequest;
 import com.morfism.aiappgenerator.model.entity.App;
 import com.morfism.aiappgenerator.model.entity.User;
 import com.morfism.aiappgenerator.mapper.AppMapper;
+import com.morfism.aiappgenerator.model.enums.CodeGenTypeEnum;
 import com.morfism.aiappgenerator.model.vo.AppVO;
 import com.morfism.aiappgenerator.model.vo.UserVO;
 import com.morfism.aiappgenerator.service.AppService;
 import com.morfism.aiappgenerator.service.UserService;
 import com.mybatisflex.core.query.QueryWrapper;
 import com.mybatisflex.spring.service.impl.ServiceImpl;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import reactor.core.publisher.Flux;
 
+import java.io.File;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -28,11 +39,15 @@ import java.util.stream.Collectors;
  *
  * @author Morfism
  */
+@Slf4j
 @Service
 public class AppServiceImpl extends ServiceImpl<AppMapper, App>  implements AppService {
 
     @Autowired
     private UserService userService;
+
+    @Autowired
+    private AiCodeGeneratorFacade aiCodeGeneratorFacade;
 
     @Override
     public AppVO getAppVO(App app) {
@@ -102,6 +117,102 @@ public class AppServiceImpl extends ServiceImpl<AppMapper, App>  implements AppS
         }).collect(Collectors.toList());
     }
 
+    @Override
+    public Flux<String> chatToGenCode(Long appId, String message, User loginUser) {
+        // 1. Parameter validation
+        ThrowUtils.throwIf(appId == null || appId <= 0, ErrorCode.PARAMS_ERROR, "Application ID cannot be null or empty");
+        ThrowUtils.throwIf(StrUtil.isBlank(message), ErrorCode.PARAMS_ERROR, "User message cannot be blank");
+        // 2. Query application information
+        App app = this.getById(appId);
+        ThrowUtils.throwIf(app == null, ErrorCode.NOT_FOUND_ERROR, "Application not found");
+        // 3. Verify user permission to access the application, only owner can generate code
+        if (!app.getUserId().equals(loginUser.getId())) {
+            throw new BusinessException(ErrorCode.NO_AUTH_ERROR, "No permission to access this application");
+        }
+        // 4. Get application code generation type
+        String codeGenTypeStr = app.getCodeGenType();
+        CodeGenTypeEnum codeGenTypeEnum = CodeGenTypeEnum.getEnumByValue(codeGenTypeStr);
+        if (codeGenTypeEnum == null) {
+            throw new BusinessException(ErrorCode.SYSTEM_ERROR, "Unsupported code generation type");
+        }
+        // 5. Call AI to generate code
+        return aiCodeGeneratorFacade.generateAndSaveCodeStream(message, codeGenTypeEnum, appId);
+    }
+
+    @Override
+    public String deployApp(Long appId, User loginUser) {
+        // 1. Parameter validation
+        ThrowUtils.throwIf(appId == null || appId <= 0, ErrorCode.PARAMS_ERROR, "Application ID cannot be null or empty");
+        ThrowUtils.throwIf(loginUser == null, ErrorCode.NOT_LOGIN_ERROR, "User not logged in");
+        // 2. Query application information
+        App app = this.getById(appId);
+        ThrowUtils.throwIf(app == null, ErrorCode.NOT_FOUND_ERROR, "Application not found");
+        // 3. Verify user permission to deploy the application, only owner can deploy
+        if (!app.getUserId().equals(loginUser.getId())) {
+            throw new BusinessException(ErrorCode.NO_AUTH_ERROR, "No permission to deploy this application");
+        }
+        // 4. Check if deployKey already exists
+        String deployKey = app.getDeployKey();
+        // Generate 6-character deployKey (letters + numbers) if not exists
+        if (StrUtil.isBlank(deployKey)) {
+            deployKey = generateUniqueDeployKey();
+        }
+        // 5. Get code generation type and build source directory path
+        String codeGenType = app.getCodeGenType();
+        String sourceDirName = codeGenType + "_" + appId;
+        String sourceDirPath = AppConstant.CODE_OUTPUT_ROOT_DIR + File.separator + sourceDirName;
+        // 6. Check if source directory exists
+        File sourceDir = new File(sourceDirPath);
+        if (!sourceDir.exists() || !sourceDir.isDirectory()) {
+            throw new BusinessException(ErrorCode.SYSTEM_ERROR, "Application code does not exist, please generate code first");
+        }
+        // 7. Copy files to deployment directory
+        String deployDirPath = AppConstant.CODE_DEPLOY_ROOT_DIR + File.separator + deployKey;
+        try {
+            FileUtil.copyContent(sourceDir, new File(deployDirPath), true);
+        } catch (Exception e) {
+            throw new BusinessException(ErrorCode.SYSTEM_ERROR, "Deployment failed: " + e.getMessage());
+        }
+        // 8. Update application deployKey and deployment time
+        App updateApp = new App();
+        updateApp.setId(appId);
+        updateApp.setDeployKey(deployKey);
+        updateApp.setDeployedTime(LocalDateTime.now());
+        boolean updateResult = this.updateById(updateApp);
+        ThrowUtils.throwIf(!updateResult, ErrorCode.OPERATION_ERROR, "Failed to update application deployment information");
+        // 9. Return accessible URL
+        return String.format("%s/%s/", AppConstant.CODE_DEPLOY_HOST, deployKey);
+    }
+
+
+    /**
+     * Generate unique deploy key with duplication check
+     * Generates a 6-character random string and ensures uniqueness in database
+     *
+     * @return unique deploy key
+     */
+    private String generateUniqueDeployKey() {
+        String deployKey;
+        int maxAttempts = 10;
+        int attempts = 0;
+        
+        do {
+            deployKey = RandomUtil.randomString(6);
+            attempts++;
+            
+            // Check if key already exists in database
+            QueryWrapper queryWrapper = QueryWrapper.create().eq("deployKey", deployKey);
+            long count = this.count(queryWrapper);
+            
+            if (count == 0) {
+                return deployKey; // Found unique key
+            }
+            
+        } while (attempts < maxAttempts);
+        
+        // If we can't find a unique key after maxAttempts, throw an exception
+        throw new BusinessException(ErrorCode.SYSTEM_ERROR, "Failed to generate unique deploy key after " + maxAttempts + " attempts");
+    }
 
 }
 

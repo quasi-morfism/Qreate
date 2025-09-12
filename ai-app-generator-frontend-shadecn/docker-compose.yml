@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  frontend:
+    build: .
+    ports:
+      - "80:80"
+    environment:
+      - API_BASE_URL=${API_BASE_URL:-http://localhost:8100/api}
+    volumes:
+      # Mount directory for deployed apps
+      - deployed-apps:/usr/share/nginx/deployed-apps
+    restart: unless-stopped
+
+volumes:
+  deployed-apps:

@@ -3,6 +3,7 @@ package com.morfism.aiappgenerator.core.saver;
 import cn.hutool.core.io.FileUtil;
 import cn.hutool.core.util.IdUtil;
 import cn.hutool.core.util.StrUtil;
+import com.morfism.aiappgenerator.constant.AppConstant;
 import com.morfism.aiappgenerator.exception.BusinessException;
 import com.morfism.aiappgenerator.exception.ErrorCode;
 import com.morfism.aiappgenerator.model.enums.CodeGenTypeEnum;
@@ -18,7 +19,7 @@ import java.nio.charset.StandardCharsets;
  * @param <T> the type of code result to save
  */
 public abstract class CodeFileSaverTemplate<T> {
-    private static final String FILE_SAVE_ROOT_DIR = System.getProperty("user.dir") + "/tmp/code_output";
+    private static final String FILE_SAVE_ROOT_DIR = AppConstant.CODE_OUTPUT_ROOT_DIR;
 
     /**
      * Main template method for saving code files
@@ -28,11 +29,11 @@ public abstract class CodeFileSaverTemplate<T> {
      * @return the directory where files were saved
      * @throws BusinessException if result is null or save operation fails
      */
-    public final File saveCode(T result){
+    public final File saveCode(T result, Long appId){
         // Validate input parameters
         validateInput(result);
         // Build unique directory for this save operation
-        String baseDirPath = buildUniqueDir();
+        String baseDirPath = buildUniqueDir(appId);
         // Save files (implemented by child classes)
         saveFiles(result, baseDirPath);
         // Return the directory object
@@ -45,9 +46,12 @@ public abstract class CodeFileSaverTemplate<T> {
      *
      * @return the created directory path
      */
-    protected String buildUniqueDir() {
+    protected String buildUniqueDir(Long appId) {
+        if (appId == null) {
+            throw new BusinessException(ErrorCode.PARAMS_ERROR, "应用 ID 不能为空");
+        }
         String codeType = getCodeType().getValue();
-        String dirPath = FILE_SAVE_ROOT_DIR + File.separator + StrUtil.format("{}_{}", codeType, IdUtil.getSnowflakeNextIdStr());
+        String dirPath = FILE_SAVE_ROOT_DIR + File.separator + StrUtil.format("{}_{}", codeType, appId);
         FileUtil.mkdir(dirPath);
         return dirPath;
     }
