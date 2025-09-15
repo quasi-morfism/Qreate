@@ -3,12 +3,12 @@ import { ref, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { marked } from 'marked'
 import { getAppVoById, deployApp } from '@/api/appController'
+import { listAppChatHistory } from '@/api/chatHistoryController'
 import myAxios from '@/request'
 import { useLoginUserStore } from '@/stores/loginUser'
 import GlobalHeader from '@/components/layouts/GlobalHeader.vue'
-import { UserAvatar } from '@/components/common'
-import { useMessage, getAvatarUrl, buildPreviewUrlWithCache } from '@/utils'
-
+import { LoadingSpinner, UserAvatar } from '@/components/common'
+import { useMessage, buildPreviewUrlWithCache } from '@/utils'
 
 const route = useRoute()
 const router = useRouter()
@@ -24,25 +24,33 @@ marked.setOptions({
 // State
 const appId = ref<string>(route.params.id as string)
 const storageKey = ref<string>('')
-const app = ref<any>({})
+const app = ref<API.BaseResponseAppVO>({} as API.BaseResponseAppVO)
 const loading = ref(true)
-const messages = ref<Array<{ role: 'user' | 'assistant'; content: string; timestamp: number }>>([])
+const messages = ref<Array<any>>([])
 const newMessage = ref('')
 const isGenerating = ref(false)
 const isDeploying = ref(false)
 const previewUrl = ref('')
 const chatContainer = ref<HTMLElement>()
 const eventSource = ref<EventSource | null>(null)
-let deployTimer: ReturnType<typeof setTimeout> | null = null
-let deployAttempts = 0
 
-const clearDeployTimer = () => {
-  if (deployTimer) {
-    clearTimeout(deployTimer)
-    deployTimer = null
+// Chat History State
+const historyLoading = ref(false)
+const hasMoreHistory = ref(false)
+const lastCreateTime = ref<string | undefined>()
+const PAGE_SIZE = 10
+
+// Debounce function
+const debounce = (func: Function, delay: number) => {
+  let timeoutId: ReturnType<typeof setTimeout>
+  return (...args: any[]) => {
+    clearTimeout(timeoutId)
+    timeoutId = setTimeout(() => {
+      func(...args)
+    }, delay)
   }
-  deployAttempts = 0
 }
+
 type ErrorWithResponse = {
   response?: { data?: { message?: string } }
   message?: string
@@ -53,24 +61,8 @@ const codeFormat = ref<'html' | 'multi_file'>(
   (route.query.adapt as 'html' | 'multi_file') || 'html',
 )
 
-// Prevent body scroll when scrolling inside chat messages
-const handleChatScroll = (event: WheelEvent) => {
-  const element = chatContainer.value
-  if (element) {
-    const { scrollTop, scrollHeight, clientHeight } = element
-    const isAtTop = scrollTop === 0
-    const isAtBottom = scrollTop + clientHeight >= scrollHeight - 1 // -1 for buffer
-
-    if ((event.deltaY < 0 && isAtTop) || (event.deltaY > 0 && isAtBottom)) {
-      event.preventDefault()
-    }
-  }
-}
-
-// Persist and restore chat state
-type ChatMessage = { role: 'user' | 'assistant'; content: string; timestamp: number }
+// Persist and restore chat state (only for draft message now)
 type PersistedChatState = {
-  messages: ChatMessage[]
   newMessage: string
   codeFormat?: 'html' | 'multi_file'
 }
@@ -79,7 +71,6 @@ const saveChatState = () => {
   try {
     if (!storageKey.value) return
     const state: PersistedChatState = {
-      messages: messages.value,
       newMessage: newMessage.value,
       codeFormat: codeFormat.value,
     }
@@ -93,9 +84,6 @@ const loadChatState = (): boolean => {
     const raw = localStorage.getItem(storageKey.value)
     if (!raw) return false
     const state = JSON.parse(raw) as PersistedChatState
-    if (Array.isArray(state?.messages)) {
-      messages.value = state.messages
-    }
     if (typeof state?.newMessage === 'string') {
       newMessage.value = state.newMessage
     }
@@ -105,6 +93,59 @@ const loadChatState = (): boolean => {
     return true
   } catch {
     return false
+  }
+}
+// Load chat history
+const loadChatHistory = async (cursor?: string) => {
+  if (historyLoading.value) return
+  historyLoading.value = true
+
+  const container = chatContainer.value
+  const oldScrollHeight = container?.scrollHeight || 0
+
+  // Enforce a minimum display time for the spinner to avoid flickering
+  const minSpinnerTime = new Promise((resolve) => setTimeout(resolve, 300))
+  const historyPromise = listAppChatHistory({
+    appId: appId.value,
+    pageSize: PAGE_SIZE,
+    lastCreateTime: cursor,
+  })
+
+  try {
+    const [res] = await Promise.all([historyPromise, minSpinnerTime])
+
+    if (res.data?.code === 0 && res.data.data?.records) {
+      const rawRecords = res.data.data.records
+
+      // Update cursor with the oldest message's time BEFORE reversing for display
+      if (rawRecords.length > 0) {
+        // API returns newest first, so the last item is the oldest and becomes the cursor
+        lastCreateTime.value = rawRecords[rawRecords.length - 1].createTime
+      }
+      hasMoreHistory.value = rawRecords.length === PAGE_SIZE
+
+      // Reverse the records to display in ascending order (oldest first)
+      const historyRecords = rawRecords.reverse().map((item) => ({
+        role: item.messageType === 'user' ? 'user' : 'assistant',
+        content: item.message || '',
+        timestamp: new Date(item.createTime as string).getTime(),
+      }))
+
+      // Prepend the chronologically sorted older messages
+      messages.value = [...historyRecords, ...messages.value]
+
+      // Preserve scroll position after loading more history
+      if (cursor && container) {
+        await nextTick()
+        const newScrollHeight = container.scrollHeight
+        container.scrollTop = newScrollHeight - oldScrollHeight
+      }
+    }
+  } catch (error) {
+    console.error('Failed to load chat history:', error)
+    message.error('Failed to load chat history')
+  } finally {
+    historyLoading.value = false
   }
 }
 
@@ -129,18 +170,29 @@ const loadApp = async () => {
     const appData = backend?.data
     app.value = backend
 
-    // Set preview URL if app is already deployed
-    if (appData?.deployKey) {
-      previewUrl.value = buildPreviewUrlWithCache(appData.deployKey)
-    }
-
     // Initialize storage key for this app
     storageKey.value = `gen_chat_${appId.value}`
+    // Restore draft message
+    loadChatState()
 
-    // Restore chat state if available; otherwise prefill but do not auto-send
-    const restored = loadChatState()
-    if (!restored && appData?.initPrompt && messages.value.length === 0) {
+    // Load initial chat history
+    await loadChatHistory()
+
+    // Scroll to bottom after initial load to show the latest messages
+    scrollToBottom()
+
+    // Auto-send initPrompt if it's user's own app and has no history
+    const isOwner = appData?.userId === loginUserStore.loginUser.id
+    if (isOwner && messages.value.length === 0 && appData?.initPrompt) {
       newMessage.value = appData.initPrompt
+      // small delay to ensure UI is ready
+      setTimeout(() => sendMessage(), 250)
+    }
+
+    // Set preview URL if app is deployed and has history
+    if (appData?.deployKey && messages.value.length >= 2) {
+      // Add timestamp to bust cache and force reload
+      previewUrl.value = `${buildPreviewUrlWithCache(appData.deployKey)}?t=${new Date().getTime()}`
     }
   } catch (error) {
     console.error('Failed to load app:', error)
@@ -187,7 +239,8 @@ const sendMessage = async () => {
     eventSource.value.close()
   }
 
-  const baseURL = myAxios.defaults.baseURL || import.meta.env.VITE_API_BASE_URL || 'http://localhost:8100/api'
+  const baseURL =
+    myAxios.defaults.baseURL || import.meta.env.VITE_API_BASE_URL || 'http://localhost:8100/api'
   const params = new URLSearchParams({
     appId: appId.value,
     message: currentMessage,
@@ -196,29 +249,6 @@ const sendMessage = async () => {
   const url = `${baseURL}/app/chat/gen/code?${params}`
 
   eventSource.value = new EventSource(url, { withCredentials: true })
-  // schedule deploy retries: 45s interval, up to 3 attempts
-  ;(() => {
-    clearDeployTimer()
-    const attempt = async () => {
-      deployAttempts += 1
-      try {
-        const res = await getAppVoById({ id: appId.value })
-        const data = res?.data?.data
-        if (data?.deployKey) {
-          previewUrl.value = buildPreviewUrlWithCache(data.deployKey)
-          clearDeployTimer()
-          return
-        }
-      } catch {}
-      const ok = await handleDeploy()
-      if (!ok && deployAttempts < 3) {
-        deployTimer = setTimeout(attempt, 45000)
-      } else {
-        clearDeployTimer()
-      }
-    }
-    deployTimer = setTimeout(attempt, 45000)
-  })()
 
   eventSource.value.onmessage = (event: MessageEvent) => {
     const currentAssistantMessage = messages.value.find(
@@ -245,7 +275,6 @@ const sendMessage = async () => {
     eventSource.value?.close()
     eventSource.value = null
     setTimeout(() => handleDeploy(), 1000)
-    clearDeployTimer()
   })
 
   eventSource.value.onerror = (err: Event) => {
@@ -298,7 +327,6 @@ const handleDeploy = async (): Promise<boolean> => {
         const deployKey = urlParts[urlParts.length - 1]
         app.value.data.deployKey = deployKey
       }
-      clearDeployTimer()
       return true
     } else {
       console.error(
@@ -329,6 +357,14 @@ const scrollToBottom = () => {
   })
 }
 
+// Handle scroll to top to load more history
+const handleHistoryScroll = async () => {
+  if (chatContainer.value?.scrollTop === 0 && hasMoreHistory.value && !historyLoading.value) {
+    await loadChatHistory(lastCreateTime.value)
+  }
+}
+const debouncedHandleHistoryScroll = debounce(handleHistoryScroll, 100)
+
 // Format time
 const formatTime = (timestamp: number) => {
   return new Date(timestamp).toLocaleTimeString()
@@ -337,15 +373,8 @@ const formatTime = (timestamp: number) => {
 // Load app on mount
 
 onMounted(() => {
-  loadApp().then(() => {
-    // Auto-send when coming from Home with `auto=1` and there is a draft message
-    const shouldAuto = String(route.query.auto || '') === '1'
-    if (shouldAuto && newMessage.value.trim() && messages.value.length === 0) {
-      // small delay to ensure UI is ready
-      setTimeout(() => sendMessage(), 250)
-    }
-  })
-  chatContainer.value?.addEventListener('wheel', handleChatScroll)
+  loadApp()
+  chatContainer.value?.addEventListener('scroll', debouncedHandleHistoryScroll)
   window.addEventListener('beforeunload', saveChatState)
 })
 
@@ -353,12 +382,11 @@ onUnmounted(() => {
   if (eventSource.value) {
     eventSource.value.close()
   }
-  chatContainer.value?.removeEventListener('wheel', handleChatScroll)
+  chatContainer.value?.removeEventListener('scroll', debouncedHandleHistoryScroll)
   window.removeEventListener('beforeunload', saveChatState)
 })
 
 // Persist on changes
-watch(messages, saveChatState, { deep: true })
 watch(newMessage, saveChatState)
 watch(codeFormat, saveChatState)
 </script>
@@ -371,6 +399,13 @@ watch(codeFormat, saveChatState)
       <!-- Chat Section -->
       <div class="chat-section">
         <div class="chat-messages" ref="chatContainer">
+          <!-- History Loading Spinner with Transition -->
+          <Transition name="fade">
+            <div v-if="historyLoading" class="history-loading-spinner">
+              <LoadingSpinner />
+            </div>
+          </Transition>
+
           <!-- Initial Welcome Message -->
           <div v-if="messages.length === 0 && !isGenerating" class="welcome-message">
             <div class="w-14 h-14 rounded-full overflow-hidden border">
@@ -381,7 +416,7 @@ watch(codeFormat, saveChatState)
               />
             </div>
             <h2>{{ app.data?.appName || 'AI App Generator' }}</h2>
-            <p v-if="app.data?.appDesc">{{ app.data.appDesc }}</p>
+            <p v-if="app.data?.initPrompt">{{ app.data.initPrompt }}</p>
             <p v-else>Start building your application by typing in the box below.</p>
           </div>
 

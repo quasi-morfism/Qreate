@@ -25,7 +25,11 @@
       </div>
       <div class="flex items-center gap-3 header-actions">
         <template v-if="loginUserStore.loginUser.id">
-          <div class="user-dropdown-container" @mouseenter="showDropdown = true" @mouseleave="showDropdown = false">
+          <div
+            class="user-dropdown-container"
+            @mouseenter="showDropdown = true"
+            @mouseleave="showDropdown = false"
+          >
             <div class="flex items-center gap-2 user-trigger">
               <Avatar class="user-avatar">
                 <AvatarImage
@@ -41,10 +45,13 @@
             <Transition name="dropdown" appear>
               <div v-if="showDropdown" class="dropdown-content">
                 <div class="dropdown-item" @click="goProfile">Profile</div>
-                <template v-if="(loginUserStore.loginUser.userRole || '').toLowerCase() === 'admin'">
+                <template
+                  v-if="(loginUserStore.loginUser.userRole || '').toLowerCase() === 'admin'"
+                >
                   <div class="dropdown-separator"></div>
                   <div class="dropdown-item" @click="goAdmin">User Management</div>
                   <div class="dropdown-item" @click="goAppManage">App Management</div>
+                  <div class="dropdown-item" @click="goChatManage">Chat Management</div>
                 </template>
                 <div class="dropdown-separator"></div>
                 <div class="dropdown-item" @click="handleLogout">Logout</div>
@@ -131,7 +138,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, watch, onMounted, onUnmounted, Transition } from 'vue'
+import { ref, reactive, watch, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useLoginUserStore } from '@/stores/loginUser'
 import { userLogin, register } from '@/api/userController'
@@ -268,6 +275,10 @@ const goAppManage = () => {
   router.push('/admin/app-manage')
 }
 
+const goChatManage = () => {
+  router.push('/admin/chat')
+}
+
 const goProfile = () => {
   router.push('/user/account-setup')
 }
@@ -304,7 +315,6 @@ const handleLoginSuccess = () => {
     redirectAfterLogin.value = ''
   }
 }
-
 </script>
 
 <style scoped>

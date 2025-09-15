@@ -10,11 +10,23 @@ spring:
     password: 283401
   profiles:
     active: local
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      password:
+      ttl: 3600
+  session:
+    store-type: redis
+    timeout: 2592000
 
 server:
   port: 8100
   servlet:
     context-path: /api
+    session:
+      cookie:
+        max-age: 2592000
 
 # springdoc-openapi????
 springdoc:

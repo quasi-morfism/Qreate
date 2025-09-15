@@ -132,6 +132,7 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User>  implements U
             throw new BusinessException(ErrorCode.NOT_LOGIN_ERROR);
         }
         // 从数据库查询（从 session更新的话如果用户修改了信息但是没更新缓存可能出 bug）
+
         long userId = currentUser.getId();
         currentUser = this.getById(userId);
         if (currentUser == null) {

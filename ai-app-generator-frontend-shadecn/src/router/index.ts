@@ -45,6 +45,30 @@ const router = createRouter({
       name: 'appManage',
       component: AppManagePage,
     },
+    {
+      path: '/admin/app',
+      name: 'admin-app',
+      component: () => import('@/views/admin/AppManagePage.vue'),
+      meta: {
+        access: 'admin',
+      },
+    },
+    {
+      path: '/admin/chat',
+      name: 'admin-chat',
+      component: () => import('@/views/admin/ChatManagePage.vue'),
+      meta: {
+        access: 'admin',
+      },
+    },
+    {
+      path: '/admin/user',
+      name: 'admin-user',
+      component: () => import('@/views/admin/UserManagePage.vue'),
+      meta: {
+        access: 'admin',
+      },
+    },
     // 重定向 /app/ 到首页
     {
       path: '/app/',

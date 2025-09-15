@@ -4,4 +4,27 @@
         "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
 <mapper namespace="com.morfism.aiappgenerator.mapper.ChatHistoryMapper">
 
+    <!-- Get latest chat history by application ID with pagination -->
+    <select id="selectLatestByAppId" resultType="com.morfism.aiappgenerator.model.entity.ChatHistory">
+        SELECT id, message, messageType, appId, userId, createTime, updateTime, isDelete
+        FROM chat_history
+        WHERE appId = #{appId} AND isDelete = 0
+        ORDER BY createTime DESC
+        LIMIT #{limit} OFFSET #{offset}
+    </select>
+
+    <!-- Get chat history count by application ID -->
+    <select id="countByAppId" resultType="java.lang.Long">
+        SELECT COUNT(*)
+        FROM chat_history
+        WHERE appId = #{appId} AND isDelete = 0
+    </select>
+
+    <!-- Soft delete all chat history by application ID -->
+    <update id="deleteByAppId">
+        UPDATE chat_history
+        SET isDelete = 1, updateTime = NOW()
+        WHERE appId = #{appId} AND isDelete = 0
+    </update>
+
 </mapper>

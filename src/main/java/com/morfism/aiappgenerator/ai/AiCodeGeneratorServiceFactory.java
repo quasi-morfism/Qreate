@@ -1,24 +1,37 @@
 package com.morfism.aiappgenerator.ai;
 
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.morfism.aiappgenerator.service.ChatHistoryService;
+import dev.langchain4j.memory.chat.MessageWindowChatMemory;
+import dev.langchain4j.model.chat.ChatModel;
+import dev.langchain4j.model.chat.StreamingChatModel;
 import dev.langchain4j.model.openai.OpenAiChatModel;
 import dev.langchain4j.model.openai.OpenAiStreamingChatModel;
 import dev.langchain4j.model.anthropic.AnthropicChatModel;
 import dev.langchain4j.model.anthropic.AnthropicStreamingChatModel;
 import dev.langchain4j.model.googleai.GoogleAiGeminiChatModel;
 import dev.langchain4j.model.googleai.GoogleAiGeminiStreamingChatModel;
+import dev.langchain4j.community.store.memory.chat.redis.RedisChatMemoryStore;
 import dev.langchain4j.service.AiServices;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
+import org.springframework.stereotype.Component;
 import lombok.extern.slf4j.Slf4j;
+
+import java.time.Duration;
 
 /**
  * AI service generate factory - supports multiple AI providers
  * 仿照简洁模式，支持多个AI模型
  */
 @Slf4j
-@Configuration
+@Component
 public class AiCodeGeneratorServiceFactory {
+
+    @Autowired
+    private RedisChatMemoryStore redisChatMemoryStore;
 
     // Provider selection
     @Value("${ai.provider:openai}")
@@ -105,23 +118,38 @@ public class AiCodeGeneratorServiceFactory {
 
     @Value("${ai.deepseek.log-responses:true}")
     private Boolean deepseekLogResponses;
+    @Autowired
+    private ChatHistoryService chatHistoryService;
 
     /**
-     * 创建 AI 代码生成器服务
-     * 仿照简洁模式，根据配置自动选择AI提供商
+     * 默认提供一个 Bean
      */
     @Bean
     public AiCodeGeneratorService aiCodeGeneratorService() {
-        log.info("Creating AI service for provider: {}", provider);
+        return getAiCodeGeneratorService(0L);
+    }
+
+    /**
+     * 根据 appId 获取服务 (使用缓存)
+     */
+    public AiCodeGeneratorService getAiCodeGeneratorService(long appId) {
+        return serviceCache.get(appId, this::createAiCodeGeneratorService);
+    }
+
+    /**
+     * 创建 AI 服务实例
+     */
+    private AiCodeGeneratorService createAiCodeGeneratorService(long appId) {
+        log.info("Creating AI service for provider: {}, appId: {}", provider, appId);
         
         return switch (provider.toLowerCase()) {
-            case "openai" -> createOpenAiService();
-            case "claude" -> createClaudeService();
-            case "gemini" -> createGeminiService();
-            case "deepseek" -> createDeepSeekService();
+            case "openai" -> createOpenAiService(appId);
+            case "claude" -> createClaudeService(appId);
+            case "gemini" -> createGeminiService(appId);
+            case "deepseek" -> createDeepSeekService(appId);
             default -> {
                 log.warn("Unknown AI provider: {}, falling back to OpenAI", provider);
-                yield createOpenAiService();
+                yield createOpenAiService(appId);
             }
         };
     }
@@ -129,7 +157,7 @@ public class AiCodeGeneratorServiceFactory {
     /**
      * 创建 OpenAI 服务
      */
-    private AiCodeGeneratorService createOpenAiService() {
+    private AiCodeGeneratorService createOpenAiService(long appId) {
         OpenAiChatModel chatModel = OpenAiChatModel.builder()
                 .apiKey(openaiApiKey)
                 .baseUrl(openaiBaseUrl)
@@ -148,16 +176,13 @@ public class AiCodeGeneratorServiceFactory {
                 .logResponses(openaiLogResponses)
                 .build();
         
-        return AiServices.builder(AiCodeGeneratorService.class)
-                .chatModel(chatModel)
-                .streamingChatModel(streamingChatModel)
-                .build();
+        return buildAiService(chatModel, streamingChatModel, appId);
     }
 
     /**
      * 创建 Claude 服务
      */
-    private AiCodeGeneratorService createClaudeService() {
+    private AiCodeGeneratorService createClaudeService(long appId) {
         AnthropicChatModel chatModel = AnthropicChatModel.builder()
                 .apiKey(claudeApiKey)
                 .modelName(claudeModelName)
@@ -176,16 +201,13 @@ public class AiCodeGeneratorServiceFactory {
                 .logResponses(claudeLogResponses)
                 .build();
         
-        return AiServices.builder(AiCodeGeneratorService.class)
-                .chatModel(chatModel)
-                .streamingChatModel(streamingChatModel)
-                .build();
+        return buildAiService(chatModel, streamingChatModel, appId);
     }
 
     /**
      * 创建 Gemini 服务
      */
-    private AiCodeGeneratorService createGeminiService() {
+    private AiCodeGeneratorService createGeminiService(long appId) {
         GoogleAiGeminiChatModel chatModel = GoogleAiGeminiChatModel.builder()
                 .apiKey(geminiApiKey)
                 .modelName(geminiModelName)
@@ -200,16 +222,13 @@ public class AiCodeGeneratorServiceFactory {
                 .temperature(geminiTemperature)
                 .build();
         
-        return AiServices.builder(AiCodeGeneratorService.class)
-                .chatModel(chatModel)
-                .streamingChatModel(streamingChatModel)
-                .build();
+        return buildAiService(chatModel, streamingChatModel, appId);
     }
 
     /**
      * 创建 DeepSeek 服务 (使用 OpenAI API 格式)
      */
-    private AiCodeGeneratorService createDeepSeekService() {
+    private AiCodeGeneratorService createDeepSeekService(long appId) {
         OpenAiChatModel chatModel = OpenAiChatModel.builder()
                 .apiKey(deepseekApiKey)
                 .baseUrl(deepseekBaseUrl)
@@ -230,9 +249,46 @@ public class AiCodeGeneratorServiceFactory {
                 .logResponses(deepseekLogResponses)
                 .build();
         
+        return buildAiService(chatModel, streamingChatModel, appId);
+    }
+
+    /**
+     * 构建 AI 服务的通用方法
+     */
+    private AiCodeGeneratorService buildAiService(ChatModel chatModel, StreamingChatModel streamingChatModel, long appId) {
+        MessageWindowChatMemory chatMemory = MessageWindowChatMemory
+                .builder()
+                .id(appId)
+                .chatMemoryStore(redisChatMemoryStore)
+                .maxMessages(20)
+                .build();
+
+        chatHistoryService.loadChatHistoryToMemory(appId, chatMemory, 20);
+                
         return AiServices.builder(AiCodeGeneratorService.class)
                 .chatModel(chatModel)
                 .streamingChatModel(streamingChatModel)
+                .chatMemory(chatMemory)
                 .build();
     }
+
+    /**
+     * AI service instance cache
+     * Cache strategy:
+     * - Maximum cache size: 1000 instances
+     * - Expire after write: 30 minutes
+     * - Expire after access: 10 minutes
+     */
+    private final Cache<Long, AiCodeGeneratorService> serviceCache = Caffeine.newBuilder()
+            .maximumSize(1000)
+            .expireAfterWrite(Duration.ofMinutes(30))
+            .expireAfterAccess(Duration.ofMinutes(10))
+            .removalListener((key, value, cause) -> {
+                log.debug("AI service instance removed, appId: {}, reason: {}", key, cause);
+            })
+            .build();
+
+
+
+
 }

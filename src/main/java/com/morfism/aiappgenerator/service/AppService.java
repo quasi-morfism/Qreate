@@ -76,4 +76,12 @@ public interface AppService extends IService<App> {
      */
     String deployApp(Long appId, User loginUser);
 
+    /**
+     * Delete application and its related chat history
+     *
+     * @param appId the ID of the application to be deleted
+     * @return true if deletion was successful
+     */
+    boolean deleteAppWithChatHistory(Long appId);
+
 }

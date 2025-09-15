@@ -9,13 +9,14 @@ import java.time.LocalDateTime;
 
 import java.io.Serial;
 
+import com.mybatisflex.core.keygen.KeyGenerators;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
 /**
- * chat history 实体类。
+ * Chat history entity class
  *
  * @author Morfism
  */
@@ -32,16 +33,16 @@ public class ChatHistory implements Serializable {
     /**
      * id
      */
-    @Id(keyType = KeyType.Auto)
+    @Id(keyType = KeyType.Generator, value = KeyGenerators.snowFlakeId)
     private Long id;
 
     /**
-     * message
+     * message content
      */
     private String message;
 
     /**
-     * user/ai
+     * message type: user/ai/error
      */
     @Column("messageType")
     private String messageType;
@@ -53,7 +54,7 @@ public class ChatHistory implements Serializable {
     private Long appId;
 
     /**
-     * creator user id
+     * user id (who sent the message)
      */
     @Column("userId")
     private Long userId;

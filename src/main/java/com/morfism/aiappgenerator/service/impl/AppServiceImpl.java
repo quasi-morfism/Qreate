@@ -18,15 +18,18 @@ import com.morfism.aiappgenerator.model.enums.CodeGenTypeEnum;
 import com.morfism.aiappgenerator.model.vo.AppVO;
 import com.morfism.aiappgenerator.model.vo.UserVO;
 import com.morfism.aiappgenerator.service.AppService;
+import com.morfism.aiappgenerator.service.ChatHistoryService;
 import com.morfism.aiappgenerator.service.UserService;
 import com.mybatisflex.core.query.QueryWrapper;
 import com.mybatisflex.spring.service.impl.ServiceImpl;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import reactor.core.publisher.Flux;
 
 import java.io.File;
+import java.io.Serializable;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
@@ -48,6 +51,9 @@ public class AppServiceImpl extends ServiceImpl<AppMapper, App>  implements AppS
 
     @Autowired
     private AiCodeGeneratorFacade aiCodeGeneratorFacade;
+
+    @Autowired
+    private ChatHistoryService chatHistoryService;
 
     @Override
     public AppVO getAppVO(App app) {
@@ -135,8 +141,17 @@ public class AppServiceImpl extends ServiceImpl<AppMapper, App>  implements AppS
         if (codeGenTypeEnum == null) {
             throw new BusinessException(ErrorCode.SYSTEM_ERROR, "Unsupported code generation type");
         }
-        // 5. Call AI to generate code
-        return aiCodeGeneratorFacade.generateAndSaveCodeStream(message, codeGenTypeEnum, appId);
+
+        // 5. Save user message to chat history
+        try {
+            chatHistoryService.saveUserMessage(appId, message, loginUser);
+        } catch (Exception e) {
+            log.warn("Failed to save user message to chat history: {}", e.getMessage());
+            // Continue with code generation even if chat history saving fails
+        }
+
+        // 6. Get shared stream from facade (all backend processing including code saving and chat history is handled independently)
+        return aiCodeGeneratorFacade.generateAndSaveCodeStream(message, codeGenTypeEnum, appId, loginUser.getId());
     }
 
     @Override
@@ -182,6 +197,59 @@ public class AppServiceImpl extends ServiceImpl<AppMapper, App>  implements AppS
         ThrowUtils.throwIf(!updateResult, ErrorCode.OPERATION_ERROR, "Failed to update application deployment information");
         // 9. Return accessible URL
         return String.format("%s/%s/", AppConstant.CODE_DEPLOY_HOST, deployKey);
+    }
+
+    @Override
+    @Transactional
+    public boolean deleteAppWithChatHistory(Long appId) {
+        ThrowUtils.throwIf(appId == null || appId <= 0, ErrorCode.PARAMS_ERROR, "Application ID cannot be null or empty");
+        
+        try {
+            // First delete related chat history
+            int deletedChatHistoryCount = chatHistoryService.deleteChatHistoryByAppId(appId);
+            log.info("Deleted {} chat history records for appId: {}", deletedChatHistoryCount, appId);
+            
+            // Then delete the application
+            boolean result = super.removeById(appId);
+            if (result) {
+                log.info("Successfully deleted application with id: {}", appId);
+            } else {
+                log.error("Failed to delete application with id: {}", appId);
+            }
+            return result;
+        } catch (Exception e) {
+            log.error("Error deleting application with chat history for appId: {}, error: {}", appId, e.getMessage());
+            throw new BusinessException(ErrorCode.OPERATION_ERROR, "Failed to delete application: " + e.getMessage());
+        }
+    }
+
+    @Override
+    @Transactional
+    public boolean removeById(Serializable id) {
+        if(id == null){
+            return false;
+        }
+        // First delete related chat history, then delete the app
+        Long appId = Long.valueOf(id.toString());
+        if(appId <=0){return false;}
+
+        try {
+            // Delete related chat history
+            int deletedChatHistoryCount = chatHistoryService.deleteChatHistoryByAppId(appId);
+            log.info("Deleted {} chat history records for appId: {}", deletedChatHistoryCount, appId);
+            
+            // Then delete the application using parent's removeById
+            boolean result = super.removeById(appId);
+            if (result) {
+                log.info("Successfully deleted application with id: {}", appId);
+            } else {
+                log.error("Failed to delete application with id: {}", appId);
+            }
+            return result;
+        } catch (Exception e) {
+            log.error("Error deleting application with chat history for appId: {}, error: {}", id, e.getMessage());
+            throw new BusinessException(ErrorCode.OPERATION_ERROR, "Failed to delete application: " + e.getMessage());
+        }
     }
 
 

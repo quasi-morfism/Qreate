@@ -111,7 +111,7 @@ public class AppController {
         App exist = appService.getById(deleteRequest.getId());
         ThrowUtils.throwIf(exist == null, ErrorCode.NOT_FOUND_ERROR);
         ThrowUtils.throwIf(!exist.getUserId().equals(loginUser.getId()), ErrorCode.NO_AUTH_ERROR);
-        boolean result = appService.removeById(deleteRequest.getId());
+        boolean result = appService.deleteAppWithChatHistory(deleteRequest.getId());
         return ResultUtils.success(result);
     }
 
@@ -156,7 +156,7 @@ public class AppController {
     @AuthCheck(mustRole = UserConstant.ADMIN_ROLE)
     public BaseResponse<Boolean> deleteAppByAdmin(@RequestBody DeleteRequest deleteRequest) {
         ThrowUtils.throwIf(deleteRequest == null || deleteRequest.getId() == null, ErrorCode.PARAMS_ERROR);
-        boolean result = appService.removeById(deleteRequest.getId());
+        boolean result = appService.deleteAppWithChatHistory(deleteRequest.getId());
         return ResultUtils.success(result);
     }
 

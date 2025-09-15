@@ -1,94 +1,125 @@
 package com.morfism.aiappgenerator.controller;
 
-import com.mybatisflex.core.paginate.Page;
-import org.springframework.web.bind.annotation.DeleteMapping;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.PutMapping;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.beans.factory.annotation.Autowired;
+import com.morfism.aiappgenerator.model.dto.chathistory.ChatHistoryQueryRequest;
 import com.morfism.aiappgenerator.model.entity.ChatHistory;
+import com.mybatisflex.core.paginate.Page;
+import com.morfism.aiappgenerator.annotation.AuthCheck;
+import com.morfism.aiappgenerator.common.BaseResponse;
+import com.morfism.aiappgenerator.common.ResultUtils;
+import com.morfism.aiappgenerator.constant.UserConstant;
+import com.morfism.aiappgenerator.exception.ErrorCode;
+import com.morfism.aiappgenerator.exception.ThrowUtils;
+import com.morfism.aiappgenerator.model.dto.chathistory.ChatHistoryAddRequest;
+import com.morfism.aiappgenerator.model.entity.User;
+import com.morfism.aiappgenerator.service.AppService;
 import com.morfism.aiappgenerator.service.ChatHistoryService;
-import org.springframework.web.bind.annotation.RestController;
-import java.util.List;
+import com.morfism.aiappgenerator.service.UserService;
+import com.mybatisflex.core.query.QueryWrapper;
+import jakarta.servlet.http.HttpServletRequest;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.web.bind.annotation.*;
+
+import java.time.LocalDateTime;
 
 /**
- * chat history 控制层。
+ * Chat History controller
  *
  * @author Morfism
  */
 @RestController
-@RequestMapping("/chatHistory")
+@RequestMapping("/chat-history")
 public class ChatHistoryController {
 
     @Autowired
     private ChatHistoryService chatHistoryService;
 
-    /**
-     * 保存chat history。
-     *
-     * @param chatHistory chat history
-     * @return {@code true} 保存成功，{@code false} 保存失败
-     */
-    @PostMapping("save")
-    public boolean save(@RequestBody ChatHistory chatHistory) {
-        return chatHistoryService.save(chatHistory);
-    }
+    @Autowired
+    private UserService userService;
+
+    @Autowired
+    private AppService appService;
 
     /**
-     * 根据主键删除chat history。
+     * Add chat history manually (mainly for testing, real chat history is saved during conversation)
      *
-     * @param id 主键
-     * @return {@code true} 删除成功，{@code false} 删除失败
+     * @param addRequest add request
+     * @param request    HTTP request
+     * @return chat history id
      */
-    @DeleteMapping("remove/{id}")
-    public boolean remove(@PathVariable Long id) {
-        return chatHistoryService.removeById(id);
+    @PostMapping("/add")
+    public BaseResponse<Long> addChatHistory(@RequestBody ChatHistoryAddRequest addRequest, HttpServletRequest request) {
+        ThrowUtils.throwIf(addRequest == null, ErrorCode.PARAMS_ERROR);
+        User loginUser = userService.getLoginUser(request);
+        
+        // Save user message (for testing purposes)
+        var chatHistory = chatHistoryService.saveUserMessage(
+                addRequest.getAppId(), 
+                addRequest.getMessage(), 
+                loginUser
+        );
+        
+        return ResultUtils.success(chatHistory.getId());
     }
 
-    /**
-     * 根据主键更新chat history。
-     *
-     * @param chatHistory chat history
-     * @return {@code true} 更新成功，{@code false} 更新失败
-     */
-    @PutMapping("update")
-    public boolean update(@RequestBody ChatHistory chatHistory) {
-        return chatHistoryService.updateById(chatHistory);
-    }
+
+
+
+
+
 
     /**
-     * 查询所有chat history。
+     * 分页查询某个应用的对话历史（游标查询）
      *
-     * @return 所有数据
+     * @param appId          应用ID
+     * @param pageSize       页面大小
+     * @param lastCreateTime 最后一条记录的创建时间
+     * @param request        请求
+     * @return 对话历史分页
      */
-    @GetMapping("list")
-    public List<ChatHistory> list() {
-        return chatHistoryService.list();
+    @GetMapping("/app/{appId}")
+    public BaseResponse<Page<ChatHistory>> listAppChatHistory(@PathVariable Long appId,
+                                                              @RequestParam(defaultValue = "10") int pageSize,
+                                                              @RequestParam(required = false) LocalDateTime lastCreateTime,
+                                                              HttpServletRequest request) {
+        User loginUser = userService.getLoginUser(request);
+        Page<ChatHistory> result = chatHistoryService.listAppChatHistoryByPage(appId, pageSize, lastCreateTime, loginUser);
+        return ResultUtils.success(result);
     }
 
-    /**
-     * 根据主键获取chat history。
-     *
-     * @param id chat history主键
-     * @return chat history详情
-     */
-    @GetMapping("getInfo/{id}")
-    public ChatHistory getInfo(@PathVariable Long id) {
-        return chatHistoryService.getById(id);
-    }
 
     /**
-     * 分页查询chat history。
+     * 管理员分页查询所有对话历史
      *
-     * @param page 分页对象
-     * @return 分页对象
+     * @param chatHistoryQueryRequest 查询请求
+     * @return 对话历史分页
      */
-    @GetMapping("page")
-    public Page<ChatHistory> page(Page<ChatHistory> page) {
-        return chatHistoryService.page(page);
+    @PostMapping("/admin/list/page/vo")
+    @AuthCheck(mustRole = UserConstant.ADMIN_ROLE)
+    public BaseResponse<Page<ChatHistory>> listAllChatHistoryByPageForAdmin(@RequestBody ChatHistoryQueryRequest chatHistoryQueryRequest) {
+        ThrowUtils.throwIf(chatHistoryQueryRequest == null, ErrorCode.PARAMS_ERROR);
+        long pageNum = chatHistoryQueryRequest.getPageNum();
+        long pageSize = chatHistoryQueryRequest.getPageSize();
+        // 查询数据
+        QueryWrapper queryWrapper = chatHistoryService.getQueryWrapper(chatHistoryQueryRequest);
+        Page<ChatHistory> result = chatHistoryService.page(Page.of(pageNum, pageSize), queryWrapper);
+        return ResultUtils.success(result);
+    }
+
+
+    /**
+     * Internal API: Delete all chat history by application ID (called when app is deleted)
+     * This endpoint is for internal use and requires admin permission
+     *
+     * @param appId application ID
+     * @return number of deleted records
+     */
+    @DeleteMapping("/internal/app/{appId}")
+    @AuthCheck(mustRole = UserConstant.ADMIN_ROLE)
+    public BaseResponse<Integer> deleteChatHistoryByAppId(@PathVariable Long appId) {
+        ThrowUtils.throwIf(appId == null || appId <= 0, ErrorCode.PARAMS_ERROR, "Invalid application ID");
+        
+        int deletedCount = chatHistoryService.deleteChatHistoryByAppId(appId);
+        return ResultUtils.success(deletedCount);
     }
 
 }
