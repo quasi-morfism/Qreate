@@ -44,7 +44,12 @@ const setHeroPrompt = (text: string) => {
 }
 
 // Format selector for generation
-const adaptFormat = ref<'html' | 'multi_file'>('html')
+const adaptFormat = ref<'html' | 'multi_file' | 'vue_project'>('html')
+
+// Watch adaptFormat changes
+watch(adaptFormat, (newValue, oldValue) => {
+  // Format changed
+})
 
 // Create app
 const handleCreateApp = async () => {
@@ -90,13 +95,13 @@ const loadMyApps = async () => {
   try {
     const res = await listMyAppVoByPage({
       pageNum: myAppsPage.value,
-      pageSize: 20,
+      pageSize: 15,
       appName: myAppsSearchText.value || undefined,
     })
 
     if (res.data?.code === 0 && res.data.data) {
       myApps.value = res.data.data.records || []
-      myAppsTotal.value = res.data.data.totalRow || 0
+      myAppsTotal.value = Number(res.data.data.totalRow) || 0
     }
   } catch (error) {
     console.error('Load my apps error:', error)
@@ -117,7 +122,7 @@ const loadSelectedApps = async () => {
 
     if (res.data?.code === 0 && res.data.data) {
       selectedApps.value = res.data.data.records || []
-      selectedAppsTotal.value = res.data.data.totalRow || 0
+      selectedAppsTotal.value = Number(res.data.data.totalRow) || 0
     }
   } catch (error) {
     console.error('Load selected apps error:', error)
@@ -263,6 +268,7 @@ onUnmounted(() => {
                 <SelectContent align="end">
                   <SelectItem value="html">HTML</SelectItem>
                   <SelectItem value="multi_file">Multi-file</SelectItem>
+                  <SelectItem value="vue_project">Vue Project</SelectItem>
                 </SelectContent>
               </Select>
               <Button
@@ -354,8 +360,8 @@ onUnmounted(() => {
 
       <div class="apps-grid" v-if="!myAppsLoading && myApps.length > 0">
         <AppCard
-          v-for="app in myApps" 
-          :key="app.id" 
+          v-for="app in myApps"
+          :key="app.id"
           :app="app"
           :show-time="true"
           @click="handleAppClick"
@@ -366,8 +372,8 @@ onUnmounted(() => {
         <LoadingSpinner text="Loading your apps..." center />
       </div>
 
-      <EmptyState 
-        v-else 
+      <EmptyState
+        v-else
         type="apps"
         title="No apps created yet"
         description="Start building your first application with AI assistance"
@@ -375,14 +381,26 @@ onUnmounted(() => {
         @action="focusSearchInput"
       />
 
-      <div v-if="myAppsTotal > 20" class="pagination-container">
-        <Pagination
-          v-model:page="myAppsPage"
-          :total="myAppsTotal"
-          :items-per-page="20"
-          :sibling-count="1"
-          @update:page="handleMyAppsPageChange"
-        />
+      <div v-if="myAppsTotal > 15" class="pagination-container">
+        <div class="pagination-wrapper">
+          <button 
+            @click="handleMyAppsPageChange(myAppsPage - 1)"
+            :disabled="myAppsPage <= 1"
+            class="pagination-btn"
+          >
+            Previous
+          </button>
+          <span class="pagination-info">
+            Page {{ myAppsPage }} of {{ Math.ceil(myAppsTotal / 15) }}
+          </span>
+          <button 
+            @click="handleMyAppsPageChange(myAppsPage + 1)"
+            :disabled="myAppsPage >= Math.ceil(myAppsTotal / 15)"
+            class="pagination-btn"
+          >
+            Next
+          </button>
+        </div>
       </div>
     </div>
 
@@ -402,8 +420,8 @@ onUnmounted(() => {
 
       <div class="apps-grid" v-if="!selectedAppsLoading && selectedApps.length > 0">
         <AppCard
-          v-for="app in selectedApps" 
-          :key="app.id" 
+          v-for="app in selectedApps"
+          :key="app.id"
           :app="app"
           variant="featured"
           :show-author="true"
@@ -415,8 +433,8 @@ onUnmounted(() => {
         <LoadingSpinner text="Loading featured apps..." center />
       </div>
 
-      <EmptyState 
-        v-else 
+      <EmptyState
+        v-else
         type="apps"
         title="No featured apps available"
         description="Check back later for new featured applications"
@@ -890,5 +908,26 @@ onUnmounted(() => {
   80% {
     transform: translate(-20px, 30px);
   }
+}
+
+/* Pagination Styles */
+.pagination-container {
+  @apply mt-8 flex justify-center;
+}
+
+.pagination-wrapper {
+  @apply flex items-center gap-4;
+}
+
+.pagination-btn {
+  @apply px-4 py-2 bg-white border border-gray-300 rounded-md text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors;
+}
+
+.pagination-btn:hover:not(:disabled) {
+  @apply bg-emerald-50 border-emerald-300 text-emerald-700;
+}
+
+.pagination-info {
+  @apply text-sm text-gray-600 font-medium;
 }
 </style>

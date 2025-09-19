@@ -2,7 +2,12 @@ package com.morfism.aiappgenerator.ai;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
+import com.morfism.aiappgenerator.ai.tools.FileWriteTool;
+import com.morfism.aiappgenerator.exception.BusinessException;
+import com.morfism.aiappgenerator.exception.ErrorCode;
+import com.morfism.aiappgenerator.model.enums.CodeGenTypeEnum;
 import com.morfism.aiappgenerator.service.ChatHistoryService;
+import dev.langchain4j.data.message.ToolExecutionResultMessage;
 import dev.langchain4j.memory.chat.MessageWindowChatMemory;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.StreamingChatModel;
@@ -14,17 +19,19 @@ import dev.langchain4j.model.googleai.GoogleAiGeminiChatModel;
 import dev.langchain4j.model.googleai.GoogleAiGeminiStreamingChatModel;
 import dev.langchain4j.community.store.memory.chat.redis.RedisChatMemoryStore;
 import dev.langchain4j.service.AiServices;
+
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.stereotype.Component;
+import org.springframework.util.StringUtils;
 import lombok.extern.slf4j.Slf4j;
 
 import java.time.Duration;
 
 /**
  * AI service generate factory - supports multiple AI providers
- * 仿照简洁模式，支持多个AI模型
+ * Follows a simplified pattern, supports multiple AI models
  */
 @Slf4j
 @Component
@@ -34,8 +41,8 @@ public class AiCodeGeneratorServiceFactory {
     private RedisChatMemoryStore redisChatMemoryStore;
 
     // Provider selection
-    @Value("${ai.provider:openai}")
-    private String provider;
+    @Value("${ai.provider:deepseek}")
+    private String defaultProvider;
 
     // OpenAI configuration
     @Value("${ai.openai.api-key:}")
@@ -118,11 +125,30 @@ public class AiCodeGeneratorServiceFactory {
 
     @Value("${ai.deepseek.log-responses:true}")
     private Boolean deepseekLogResponses;
+
+    // DeepSeek Reasoning configuration (uses OpenAI API format)
+    @Value("${ai.deepseek-reasoning.api-key:}")
+    private String deepseekReasoningApiKey;
+
+    @Value("${ai.deepseek-reasoning.base-url:https://api.deepseek.com/v1}")
+    private String deepseekReasoningBaseUrl;
+
+    @Value("${ai.deepseek-reasoning.model-name:deepseek-reasoner}")
+    private String deepseekReasoningModelName;
+
+    @Value("${ai.deepseek-reasoning.max-completion-tokens:32768}")
+    private Integer deepseekReasoningMaxCompletionTokens;
+
+    @Value("${ai.deepseek-reasoning.log-requests:true}")
+    private Boolean deepseekReasoningLogRequests;
+
+    @Value("${ai.deepseek-reasoning.log-responses:true}")
+    private Boolean deepseekReasoningLogResponses;
     @Autowired
     private ChatHistoryService chatHistoryService;
 
     /**
-     * 默认提供一个 Bean
+     * Provide a default Bean
      */
     @Bean
     public AiCodeGeneratorService aiCodeGeneratorService() {
@@ -130,161 +156,258 @@ public class AiCodeGeneratorServiceFactory {
     }
 
     /**
-     * 根据 appId 获取服务 (使用缓存)
+     * Get service by appId (with cache) - this method is for backward compatibility
      */
     public AiCodeGeneratorService getAiCodeGeneratorService(long appId) {
-        return serviceCache.get(appId, this::createAiCodeGeneratorService);
+        return getAiCodeGeneratorService(appId, CodeGenTypeEnum.HTML);
     }
 
     /**
-     * 创建 AI 服务实例
+     * Get service by appId and code generation type (with cache)
      */
-    private AiCodeGeneratorService createAiCodeGeneratorService(long appId) {
-        log.info("Creating AI service for provider: {}, appId: {}", provider, appId);
+    public AiCodeGeneratorService getAiCodeGeneratorService(long appId, CodeGenTypeEnum codeGenType) {
+        String cacheKey = buildCacheKey(appId, codeGenType);
+        return serviceCache.get(cacheKey, key -> createAiCodeGeneratorService(appId, codeGenType));
+    }
+
+    /**
+     * Get service by appId, code generation type and provider
+     */
+    public AiCodeGeneratorService getAiCodeGeneratorService(long appId, CodeGenTypeEnum codeGenType, String provider) {
+        return createAiCodeGeneratorService(appId, codeGenType, provider);
+    }
+
+    /**
+     * Build cache key
+     */
+    private String buildCacheKey(long appId, CodeGenTypeEnum codeGenType) {
+        return appId + "_" + codeGenType.getValue();
+    }
+
+    /**
+     * Create new AI service instance (without specifying provider, use default)
+     */
+    private AiCodeGeneratorService createAiCodeGeneratorService(long appId, CodeGenTypeEnum codeGenType) {
+        return createAiCodeGeneratorService(appId, codeGenType, null);
+    }
+
+    /**
+     * Create new AI service instance
+     */
+    private AiCodeGeneratorService createAiCodeGeneratorService(long appId, CodeGenTypeEnum codeGenType, String provider) {
+        // Use the passed provider, if null then use default provider
+        String actualProvider = StringUtils.hasText(provider) ? provider : defaultProvider;
         
-        return switch (provider.toLowerCase()) {
-            case "openai" -> createOpenAiService(appId);
-            case "claude" -> createClaudeService(appId);
-            case "gemini" -> createGeminiService(appId);
-            case "deepseek" -> createDeepSeekService(appId);
-            default -> {
-                log.warn("Unknown AI provider: {}, falling back to OpenAI", provider);
-                yield createOpenAiService(appId);
+        // Special logic: DeepSeek + VUE_PROJECT automatically switches to DeepSeek Reasoning
+        if ("deepseek".equalsIgnoreCase(actualProvider) && codeGenType == CodeGenTypeEnum.VUE_PROJECT) {
+            actualProvider = "deepseek-reasoning";
+        }
+        
+        log.info("Creating AI service for provider: {}, codeGenType: {}, appId: {}", actualProvider, codeGenType, appId);
+        
+        // Set unified variables based on provider
+        String currentApiKey;
+        String currentBaseUrl;
+        String currentModelName;
+        Integer currentMaxTokens;
+        Double currentTemperature = null;
+        Boolean currentLogRequests;
+        Boolean currentLogResponses;
+        String providerType; // Used to determine which type of model to create
+        
+        switch (actualProvider.toLowerCase()) {
+            case "openai" -> {
+                currentApiKey = openaiApiKey;
+                currentBaseUrl = openaiBaseUrl;
+                currentModelName = openaiModelName;
+                currentMaxTokens = openaiMaxCompletionTokens;
+                currentTemperature = openaiTemperature;
+                currentLogRequests = openaiLogRequests;
+                currentLogResponses = openaiLogResponses;
+                providerType = "openai";
             }
-        };
-    }
-
-    /**
-     * 创建 OpenAI 服务
-     */
-    private AiCodeGeneratorService createOpenAiService(long appId) {
-        OpenAiChatModel chatModel = OpenAiChatModel.builder()
-                .apiKey(openaiApiKey)
-                .baseUrl(openaiBaseUrl)
-                .modelName(openaiModelName)
-                .maxCompletionTokens(openaiMaxCompletionTokens)
-                .logRequests(openaiLogRequests)
-                .logResponses(openaiLogResponses)
-                .build();
+            case "claude" -> {
+                currentApiKey = claudeApiKey;
+                currentBaseUrl = null; // Claude doesn't need baseUrl
+                currentModelName = claudeModelName;
+                currentMaxTokens = claudeMaxTokens;
+                currentTemperature = claudeTemperature;
+                currentLogRequests = claudeLogRequests;
+                currentLogResponses = claudeLogResponses;
+                providerType = "claude";
+            }
+            case "gemini" -> {
+                currentApiKey = geminiApiKey;
+                currentBaseUrl = null; // Gemini doesn't need baseUrl
+                currentModelName = geminiModelName;
+                currentMaxTokens = geminiMaxTokens;
+                currentTemperature = geminiTemperature;
+                currentLogRequests = geminiLogRequests;
+                currentLogResponses = geminiLogResponses;
+                providerType = "gemini";
+            }
+            case "deepseek" -> {
+                currentApiKey = deepseekApiKey;
+                currentBaseUrl = deepseekBaseUrl;
+                currentModelName = deepseekModelName;
+                currentMaxTokens = deepseekMaxCompletionTokens;
+                currentTemperature = deepseekTemperature;
+                currentLogRequests = deepseekLogRequests;
+                currentLogResponses = deepseekLogResponses;
+                providerType = "openai"; // DeepSeek uses OpenAI API format
+            }
+            case "deepseek-reasoning" -> {
+                currentApiKey = deepseekReasoningApiKey;
+                currentBaseUrl = deepseekReasoningBaseUrl;
+                currentModelName = deepseekReasoningModelName;
+                currentMaxTokens = deepseekReasoningMaxCompletionTokens;
+                currentTemperature = null; // Reasoning model doesn't support temperature
+                currentLogRequests = deepseekReasoningLogRequests;
+                currentLogResponses = deepseekReasoningLogResponses;
+                providerType = "openai"; // DeepSeek Reasoning uses OpenAI API format
+            }
+            default -> {
+                log.warn("Unknown AI provider: {}, falling back to OpenAI", actualProvider);
+                currentApiKey = openaiApiKey;
+                currentBaseUrl = openaiBaseUrl;
+                currentModelName = openaiModelName;
+                currentMaxTokens = openaiMaxCompletionTokens;
+                currentTemperature = openaiTemperature;
+                currentLogRequests = openaiLogRequests;
+                currentLogResponses = openaiLogResponses;
+                providerType = "openai";
+            }
+        }
         
-        OpenAiStreamingChatModel streamingChatModel = OpenAiStreamingChatModel.builder()
-                .apiKey(openaiApiKey)
-                .baseUrl(openaiBaseUrl)
-                .modelName(openaiModelName)
-                .maxCompletionTokens(openaiMaxCompletionTokens)               
-                .logRequests(openaiLogRequests)
-                .logResponses(openaiLogResponses)
-                .build();
-        
-        return buildAiService(chatModel, streamingChatModel, appId);
-    }
-
-    /**
-     * 创建 Claude 服务
-     */
-    private AiCodeGeneratorService createClaudeService(long appId) {
-        AnthropicChatModel chatModel = AnthropicChatModel.builder()
-                .apiKey(claudeApiKey)
-                .modelName(claudeModelName)
-                .maxTokens(claudeMaxTokens)
-                .temperature(claudeTemperature)
-                .logRequests(claudeLogRequests)
-                .logResponses(claudeLogResponses)
-                .build();
-        
-        AnthropicStreamingChatModel streamingChatModel = AnthropicStreamingChatModel.builder()
-                .apiKey(claudeApiKey)
-                .modelName(claudeModelName)
-                .maxTokens(claudeMaxTokens)
-                .temperature(claudeTemperature)
-                .logRequests(claudeLogRequests)
-                .logResponses(claudeLogResponses)
-                .build();
-        
-        return buildAiService(chatModel, streamingChatModel, appId);
-    }
-
-    /**
-     * 创建 Gemini 服务
-     */
-    private AiCodeGeneratorService createGeminiService(long appId) {
-        GoogleAiGeminiChatModel chatModel = GoogleAiGeminiChatModel.builder()
-                .apiKey(geminiApiKey)
-                .modelName(geminiModelName)
-                .maxOutputTokens(geminiMaxTokens)
-                .temperature(geminiTemperature)
-                .build();
-        
-        GoogleAiGeminiStreamingChatModel streamingChatModel = GoogleAiGeminiStreamingChatModel.builder()
-                .apiKey(geminiApiKey)
-                .modelName(geminiModelName)
-                .maxOutputTokens(geminiMaxTokens)
-                .temperature(geminiTemperature)
-                .build();
-        
-        return buildAiService(chatModel, streamingChatModel, appId);
-    }
-
-    /**
-     * 创建 DeepSeek 服务 (使用 OpenAI API 格式)
-     */
-    private AiCodeGeneratorService createDeepSeekService(long appId) {
-        OpenAiChatModel chatModel = OpenAiChatModel.builder()
-                .apiKey(deepseekApiKey)
-                .baseUrl(deepseekBaseUrl)
-                .modelName(deepseekModelName)
-                .maxCompletionTokens(deepseekMaxCompletionTokens)
-                .temperature(deepseekTemperature)
-                .logRequests(deepseekLogRequests)
-                .logResponses(deepseekLogResponses)
-                .build();
-        
-        OpenAiStreamingChatModel streamingChatModel = OpenAiStreamingChatModel.builder()
-                .apiKey(deepseekApiKey)
-                .baseUrl(deepseekBaseUrl)
-                .modelName(deepseekModelName)
-                .maxCompletionTokens(deepseekMaxCompletionTokens)
-                .temperature(deepseekTemperature)
-                .logRequests(deepseekLogRequests)
-                .logResponses(deepseekLogResponses)
-                .build();
-        
-        return buildAiService(chatModel, streamingChatModel, appId);
-    }
-
-    /**
-     * 构建 AI 服务的通用方法
-     */
-    private AiCodeGeneratorService buildAiService(ChatModel chatModel, StreamingChatModel streamingChatModel, long appId) {
+        // Build independent chat memory based on appId
         MessageWindowChatMemory chatMemory = MessageWindowChatMemory
                 .builder()
                 .id(appId)
                 .chatMemoryStore(redisChatMemoryStore)
                 .maxMessages(20)
                 .build();
-
+        
+        // Load chat history from database into memory
         chatHistoryService.loadChatHistoryToMemory(appId, chatMemory, 20);
-                
-        return AiServices.builder(AiCodeGeneratorService.class)
-                .chatModel(chatModel)
-                .streamingChatModel(streamingChatModel)
-                .chatMemory(chatMemory)
-                .build();
+        
+        // Create unified ChatModel and StreamingChatModel
+        ChatModel chatModel = createUnifiedChatModel(providerType, currentApiKey, currentBaseUrl, 
+                currentModelName, currentMaxTokens, currentTemperature, currentLogRequests, currentLogResponses);
+        StreamingChatModel streamingChatModel = createUnifiedStreamingChatModel(providerType, currentApiKey, currentBaseUrl,
+                currentModelName, currentMaxTokens, currentTemperature, currentLogRequests, currentLogResponses);
+        
+        // Choose different model configurations based on code generation type
+        return switch (codeGenType) {
+            // Vue project generation uses reasoning model and tools
+            case VUE_PROJECT -> AiServices.builder(AiCodeGeneratorService.class)
+                    .streamingChatModel(streamingChatModel)
+                    .chatMemoryProvider(memoryId -> chatMemory)
+                    .tools(new FileWriteTool())
+                    .hallucinatedToolNameStrategy(toolExecutionRequest -> ToolExecutionResultMessage.from(
+                        toolExecutionRequest, "Error: there is no tool called " + toolExecutionRequest.name()
+                    ))
+                    .build();
+            // HTML and multi-file generation use default model
+            case HTML, MULTI_FILE -> AiServices.builder(AiCodeGeneratorService.class)
+                    .chatModel(chatModel)
+                    .streamingChatModel(streamingChatModel)
+                    .chatMemory(chatMemory)
+                    .build();
+            default -> throw new BusinessException(ErrorCode.SYSTEM_ERROR,
+                    "Unsupported code generation type: " + codeGenType.getValue());
+        };
+    }
+
+
+    /**
+     * Unified ChatModel creation
+     */
+    private ChatModel createUnifiedChatModel(String providerType, String apiKey, String baseUrl, 
+            String modelName, Integer maxTokens, Double temperature, Boolean logRequests, Boolean logResponses) {
+        return switch (providerType.toLowerCase()) {
+            case "openai" -> {
+                var builder = OpenAiChatModel.builder()
+                        .apiKey(apiKey)
+                        .modelName(modelName)
+                        .maxCompletionTokens(maxTokens)
+                        .logRequests(logRequests)
+                        .logResponses(logResponses);
+                if (baseUrl != null) builder.baseUrl(baseUrl);
+                if (temperature != null) builder.temperature(temperature);
+                yield builder.build();
+            }
+            case "claude" -> {
+                var builder = AnthropicChatModel.builder()
+                        .apiKey(apiKey)
+                        .modelName(modelName)
+                        .maxTokens(maxTokens)
+                        .logRequests(logRequests)
+                        .logResponses(logResponses);
+                if (temperature != null) builder.temperature(temperature);
+                yield builder.build();
+            }
+            case "gemini" -> {
+                var builder = GoogleAiGeminiChatModel.builder()
+                        .apiKey(apiKey)
+                        .modelName(modelName)
+                        .maxOutputTokens(maxTokens);
+                if (temperature != null) builder.temperature(temperature);
+                yield builder.build();
+            }
+            default -> throw new BusinessException(ErrorCode.SYSTEM_ERROR, 
+                    "Unsupported provider type: " + providerType);
+        };
+    }
+
+    /**
+     * Unified StreamingChatModel creation
+     */
+    private StreamingChatModel createUnifiedStreamingChatModel(String providerType, String apiKey, String baseUrl,
+            String modelName, Integer maxTokens, Double temperature, Boolean logRequests, Boolean logResponses) {
+        return switch (providerType.toLowerCase()) {
+            case "openai" -> {
+                var builder = OpenAiStreamingChatModel.builder()
+                        .apiKey(apiKey)
+                        .modelName(modelName)
+                        .maxCompletionTokens(maxTokens)
+                        .logRequests(logRequests)
+                        .logResponses(logResponses);
+                if (baseUrl != null) builder.baseUrl(baseUrl);
+                if (temperature != null) builder.temperature(temperature);
+                yield builder.build();
+            }
+            case "claude" -> {
+                var builder = AnthropicStreamingChatModel.builder()
+                        .apiKey(apiKey)
+                        .modelName(modelName)
+                        .maxTokens(maxTokens)
+                        .logRequests(logRequests)
+                        .logResponses(logResponses);
+                if (temperature != null) builder.temperature(temperature);
+                yield builder.build();
+            }
+            case "gemini" -> {
+                var builder = GoogleAiGeminiStreamingChatModel.builder()
+                        .apiKey(apiKey)
+                        .modelName(modelName)
+                        .maxOutputTokens(maxTokens);
+                if (temperature != null) builder.temperature(temperature);
+                yield builder.build();
+            }
+            default -> throw new BusinessException(ErrorCode.SYSTEM_ERROR, 
+                    "Unsupported provider type: " + providerType);
+        };
     }
 
     /**
      * AI service instance cache
-     * Cache strategy:
-     * - Maximum cache size: 1000 instances
-     * - Expire after write: 30 minutes
-     * - Expire after access: 10 minutes
      */
-    private final Cache<Long, AiCodeGeneratorService> serviceCache = Caffeine.newBuilder()
+    private final Cache<String, AiCodeGeneratorService> serviceCache = Caffeine.newBuilder()
             .maximumSize(1000)
             .expireAfterWrite(Duration.ofMinutes(30))
             .expireAfterAccess(Duration.ofMinutes(10))
             .removalListener((key, value, cause) -> {
-                log.debug("AI service instance removed, appId: {}, reason: {}", key, cause);
+                log.debug("AI service instance removed from cache, cache key: {}, reason: {}", key, cause);
             })
             .build();
 

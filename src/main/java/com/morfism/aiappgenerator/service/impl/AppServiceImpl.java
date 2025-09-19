@@ -7,6 +7,7 @@ import cn.hutool.core.util.RandomUtil;
 import cn.hutool.core.util.StrUtil;
 import com.morfism.aiappgenerator.constant.AppConstant;
 import com.morfism.aiappgenerator.core.AiCodeGeneratorFacade;
+import com.morfism.aiappgenerator.core.builder.VueProjectBuilder;
 import com.morfism.aiappgenerator.exception.BusinessException;
 import com.morfism.aiappgenerator.exception.ErrorCode;
 import com.morfism.aiappgenerator.exception.ThrowUtils;
@@ -22,6 +23,7 @@ import com.morfism.aiappgenerator.service.ChatHistoryService;
 import com.morfism.aiappgenerator.service.UserService;
 import com.mybatisflex.core.query.QueryWrapper;
 import com.mybatisflex.spring.service.impl.ServiceImpl;
+import dev.langchain4j.service.V;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -54,6 +56,9 @@ public class AppServiceImpl extends ServiceImpl<AppMapper, App>  implements AppS
 
     @Autowired
     private ChatHistoryService chatHistoryService;
+
+    @Autowired
+    private VueProjectBuilder vueProjectBuilder;
 
     @Override
     public AppVO getAppVO(App app) {
@@ -155,6 +160,63 @@ public class AppServiceImpl extends ServiceImpl<AppMapper, App>  implements AppS
     }
 
     @Override
+    public Flux<String> chatToGenCode(Long appId, String message, String adapt, User loginUser) {
+        // 1. Parameter validation
+        ThrowUtils.throwIf(appId == null || appId <= 0, ErrorCode.PARAMS_ERROR, "Application ID cannot be null or empty");
+        ThrowUtils.throwIf(StrUtil.isBlank(message), ErrorCode.PARAMS_ERROR, "User message cannot be blank");
+        // 2. Query application information
+        App app = this.getById(appId);
+        ThrowUtils.throwIf(app == null, ErrorCode.NOT_FOUND_ERROR, "Application not found");
+        // 3. Verify user permission to access the application, only owner can generate code
+        if (!app.getUserId().equals(loginUser.getId())) {
+            throw new BusinessException(ErrorCode.NO_AUTH_ERROR, "No permission to access this application");
+        }
+        
+        // 4. Determine code generation type
+        CodeGenTypeEnum codeGenTypeEnum;
+        if (StrUtil.isNotBlank(adapt)) {
+            // Use adapt parameter if provided
+            codeGenTypeEnum = CodeGenTypeEnum.getEnumByValue(adapt);
+            if (codeGenTypeEnum == null) {
+                throw new BusinessException(ErrorCode.PARAMS_ERROR, "Invalid adapt parameter: " + adapt);
+            }
+            log.info("🔄 Using adapt parameter for code generation: {} (appId: {})", adapt, appId);
+            
+            // Update app's codeGenType to match the actual generation type for consistency
+            if (!adapt.equals(app.getCodeGenType())) {
+                App updateApp = new App();
+                updateApp.setId(appId);
+                updateApp.setCodeGenType(adapt);
+                boolean updateResult = this.updateById(updateApp);
+                if (updateResult) {
+                    log.info("✅ Updated app codeGenType to: {} (appId: {})", adapt, appId);
+                } else {
+                    log.warn("⚠️ Failed to update app codeGenType to: {} (appId: {})", adapt, appId);
+                }
+            }
+        } else {
+            // Fallback to database codeGenType
+            String codeGenTypeStr = app.getCodeGenType();
+            codeGenTypeEnum = CodeGenTypeEnum.getEnumByValue(codeGenTypeStr);
+            if (codeGenTypeEnum == null) {
+                throw new BusinessException(ErrorCode.SYSTEM_ERROR, "Unsupported code generation type: " + codeGenTypeStr);
+            }
+            log.info("📊 Using database codeGenType for code generation: {} (appId: {})", codeGenTypeStr, appId);
+        }
+
+        // 5. Save user message to chat history
+        try {
+            chatHistoryService.saveUserMessage(appId, message, loginUser);
+        } catch (Exception e) {
+            log.warn("Failed to save user message to chat history: {}", e.getMessage());
+            // Continue with code generation even if chat history saving fails
+        }
+
+        // 6. Get shared stream from facade
+        return aiCodeGeneratorFacade.generateAndSaveCodeStream(message, codeGenTypeEnum, appId, loginUser.getId());
+    }
+
+    @Override
     public String deployApp(Long appId, User loginUser) {
         // 1. Parameter validation
         ThrowUtils.throwIf(appId == null || appId <= 0, ErrorCode.PARAMS_ERROR, "Application ID cannot be null or empty");
@@ -176,12 +238,37 @@ public class AppServiceImpl extends ServiceImpl<AppMapper, App>  implements AppS
         String codeGenType = app.getCodeGenType();
         String sourceDirName = codeGenType + "_" + appId;
         String sourceDirPath = AppConstant.CODE_OUTPUT_ROOT_DIR + File.separator + sourceDirName;
-        // 6. Check if source directory exists
+
+        log.info("🔍 部署应用 - appId: {}, codeGenType: {}, sourceDirPath: {}", appId, codeGenType, sourceDirPath);
+
+        // 6. 检查源目录是否存在
         File sourceDir = new File(sourceDirPath);
+        log.info("🔍 检查源目录: {} - 存在: {}, 是目录: {}", sourceDirPath, sourceDir.exists(), sourceDir.isDirectory());
+        
         if (!sourceDir.exists() || !sourceDir.isDirectory()) {
-            throw new BusinessException(ErrorCode.SYSTEM_ERROR, "Application code does not exist, please generate code first");
+            log.error("❌ 应用代码目录不存在或不是目录: {}", sourceDirPath);
+            throw new BusinessException(ErrorCode.SYSTEM_ERROR, "应用代码不存在，请先生成代码");
         }
-        // 7. Copy files to deployment directory
+// 7. Vue 项目特殊处理：执行构建
+        CodeGenTypeEnum codeGenTypeEnum = CodeGenTypeEnum.getEnumByValue(codeGenType);
+        if (codeGenTypeEnum == CodeGenTypeEnum.VUE_PROJECT) {
+            log.info("🔨 检测到Vue项目，开始构建过程...");
+            // Vue 项目需要构建
+            boolean buildSuccess = vueProjectBuilder.buildProject(sourceDirPath);
+            log.info("🔨 Vue项目构建结果: {}", buildSuccess ? "成功" : "失败");
+            ThrowUtils.throwIf(!buildSuccess, ErrorCode.SYSTEM_ERROR, "Vue 项目构建失败，请检查代码和依赖");
+            
+            // 检查 dist 目录是否存在
+            File distDir = new File(sourceDirPath, "dist");
+            log.info("🔍 检查dist目录: {} - 存在: {}", distDir.getAbsolutePath(), distDir.exists());
+            ThrowUtils.throwIf(!distDir.exists(), ErrorCode.SYSTEM_ERROR, "Vue 项目构建完成但未生成 dist 目录");
+            
+            // 将 dist 目录作为部署源
+            sourceDir = distDir;
+            log.info("✅ Vue 项目构建成功，将部署 dist 目录: {}", distDir.getAbsolutePath());
+        }
+// 8. 复制文件到部署目录
+
         String deployDirPath = AppConstant.CODE_DEPLOY_ROOT_DIR + File.separator + deployKey;
         try {
             FileUtil.copyContent(sourceDir, new File(deployDirPath), true);
@@ -191,6 +278,7 @@ public class AppServiceImpl extends ServiceImpl<AppMapper, App>  implements AppS
         // 8. Update application deployKey and deployment time
         App updateApp = new App();
         updateApp.setId(appId);
+
         updateApp.setDeployKey(deployKey);
         updateApp.setDeployedTime(LocalDateTime.now());
         boolean updateResult = this.updateById(updateApp);

@@ -66,6 +66,20 @@ public interface AppService extends IService<App> {
      */
     Flux<String> chatToGenCode(Long appId, String message, User loginUser);
 
+    /**
+     * 聊天生成代码服务（流式响应），支持动态代码类型
+     * Chat-to-code generation service with streaming response and dynamic code type
+     *
+     * @param appId     应用ID/Application ID
+     * @param message   用户消息/User message for code generation
+     * @param adapt     代码生成类型覆盖参数/Code generation type override parameter
+     * @param loginUser 登录用户/Current login user
+     * @return 代码生成的响应式流/Reactive stream of generated code
+     * @throws BusinessException 当应用不存在、用户无权限或代码生成类型不支持时抛出异常
+     *                          /when app not found, user has no permission, or unsupported code generation type
+     */
+    Flux<String> chatToGenCode(Long appId, String message, String adapt, User loginUser);
+
 
     /**
      * Deploys an application based on the provided application ID and user information.

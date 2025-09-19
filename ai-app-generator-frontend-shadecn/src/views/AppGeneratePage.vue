@@ -52,19 +52,19 @@ const debounce = (func: Function, delay: number) => {
 }
 
 type ErrorWithResponse = {
-  response?: { data?: { message?: string } }
+  response?: { data?: { message?: string, code?: number } }
   message?: string
 }
 
 // Use adapt format from query (provided by Home page)
-const codeFormat = ref<'html' | 'multi_file'>(
-  (route.query.adapt as 'html' | 'multi_file') || 'html',
+const codeFormat = ref<'html' | 'multi_file' | 'vue_project'>(
+  (route.query.adapt as 'html' | 'multi_file' | 'vue_project') || 'html',
 )
 
 // Persist and restore chat state (only for draft message now)
 type PersistedChatState = {
   newMessage: string
-  codeFormat?: 'html' | 'multi_file'
+  codeFormat?: 'html' | 'multi_file' | 'vue_project'
 }
 
 const saveChatState = () => {
@@ -106,7 +106,7 @@ const loadChatHistory = async (cursor?: string) => {
   // Enforce a minimum display time for the spinner to avoid flickering
   const minSpinnerTime = new Promise((resolve) => setTimeout(resolve, 300))
   const historyPromise = listAppChatHistory({
-    appId: appId.value,
+    appId: safeParseId(appId.value),
     pageSize: PAGE_SIZE,
     lastCreateTime: cursor,
   })
@@ -125,11 +125,29 @@ const loadChatHistory = async (cursor?: string) => {
       hasMoreHistory.value = rawRecords.length === PAGE_SIZE
 
       // Reverse the records to display in ascending order (oldest first)
-      const historyRecords = rawRecords.reverse().map((item) => ({
-        role: item.messageType === 'user' ? 'user' : 'assistant',
-        content: item.message || '',
-        timestamp: new Date(item.createTime as string).getTime(),
-      }))
+      const historyRecords = rawRecords.reverse().map((item) => {
+        const message = {
+          role: item.messageType === 'user' ? 'user' : 'assistant',
+          content: item.message || '',
+          timestamp: new Date(item.createTime as string).getTime(),
+        }
+
+        // Process tool calls for assistant messages
+        if (message.role === 'assistant' && message.content) {
+          // Parse tool calls from history
+          const toolCalls = parseHistoryToolCalls(message.content)
+          message.toolCalls = toolCalls
+          
+          // Remove tool call markers from display content
+          let cleanContent = message.content
+          toolCalls.forEach(toolCall => {
+            cleanContent = cleanContent.replace(toolCall.fullMatch, '')
+          })
+          message.content = cleanContent.trim()
+        }
+
+        return message
+      })
 
       // Prepend the chronologically sorted older messages
       messages.value = [...historyRecords, ...messages.value]
@@ -161,13 +179,16 @@ const loadApp = async () => {
       return
     }
 
-    const response = await getAppVoById({ id: appId.value })
+    console.log('🔍 Requesting app with ID:', appId.value, 'type:', typeof appId.value)
+    const response = await getAppVoById({ id: safeParseId(appId.value) })
     const backend = response.data
+    console.log('🔍 Backend response:', backend)
     if (backend?.code !== 0) {
       message.error(`Failed to load app: ${backend?.message || 'System Error'}`)
       return
     }
     const appData = backend?.data
+    console.log('🔍 App data:', appData)
     app.value = backend
 
     // Initialize storage key for this app
@@ -181,9 +202,10 @@ const loadApp = async () => {
     // Scroll to bottom after initial load to show the latest messages
     scrollToBottom()
 
-    // Auto-send initPrompt if it's user's own app and has no history
-    const isOwner = appData?.userId === loginUserStore.loginUser.id
-    if (isOwner && messages.value.length === 0 && appData?.initPrompt) {
+    // Auto-send initPrompt only if auto=1 from home page AND no existing messages
+    const shouldAutoSend = route.query.auto === '1' && messages.value.length === 0
+
+    if (shouldAutoSend && appData?.initPrompt) {
       newMessage.value = appData.initPrompt
       // small delay to ensure UI is ready
       setTimeout(() => sendMessage(), 250)
@@ -257,10 +279,19 @@ const sendMessage = async () => {
 
     try {
       const data = JSON.parse(event.data)
-      const content = data.q
-      if (content && currentAssistantMessage) {
-        currentAssistantMessage.content += content
-        isGenerating.value = false
+      const newContent = data.q
+      if (newContent && currentAssistantMessage) {
+        // Process streaming content with bracket detection
+        const displayContent = processStreamingContent(newContent, currentAssistantMessage)
+        
+        // Add display content to message
+        if (displayContent) {
+          currentAssistantMessage.content += displayContent
+        }
+        
+        // Update tool calls
+        currentAssistantMessage.toolCalls = [...pendingToolCalls.value]
+        
         scrollToBottom()
       }
     } catch (e) {
@@ -270,11 +301,33 @@ const sendMessage = async () => {
 
   eventSource.value.addEventListener('done', () => {
     console.log("SSE stream finished with 'done' event. Closing connection.")
-    console.log('Triggering deployment via handleDeploy() in 1 second...')
-    message.success('AI code generation complete. Deploying application in 1 second...')
+    
+    // Process any remaining buffer content
+    const currentAssistantMessage = messages.value.find(
+      (m) => m.role === 'assistant' && m.timestamp === assistantMessageTimestamp,
+    )
+    if (currentAssistantMessage && streamingBuffer.value) {
+      currentAssistantMessage.content += streamingBuffer.value
+    }
+    
+    // Clear streaming state
+    streamingBuffer.value = ''
+    pendingToolCalls.value = []
+    
+    isGenerating.value = false
     eventSource.value?.close()
     eventSource.value = null
-    setTimeout(() => handleDeploy(), 1000)
+
+    // For Vue projects, wait longer to allow build process to complete
+    if (codeFormat.value === 'vue_project') {
+      console.log('Vue project detected, waiting 10 seconds for build to complete...')
+      message.success('Vue project generation complete. Building and deploying in 10 seconds...')
+      setTimeout(() => handleDeploy(), 10000) // Wait 10 seconds for Vue build
+    } else {
+      console.log('Triggering deployment via handleDeploy() in 1 second...')
+      message.success('AI code generation complete. Deploying application in 1 second...')
+      setTimeout(() => handleDeploy(), 1000)
+    }
   })
 
   eventSource.value.onerror = (err: Event) => {
@@ -286,9 +339,9 @@ const sendMessage = async () => {
       // or similar, but the original code had `isError` which is not a property of the message object.
       // I will remove the line as it's not part of the original file's state.
     }
+    isGenerating.value = false
     eventSource.value?.close()
     eventSource.value = null
-    isGenerating.value = false
     saveChatState()
   }
 }
@@ -306,18 +359,22 @@ const handleDeploy = async (): Promise<boolean> => {
     return false
   }
   isDeploying.value = true
-  console.log(`Deploying app with ID: ${appId.value}`)
+  console.log(`🚀 Starting deployment for app ID: ${appId.value}`)
   try {
     // The parameter should be { appId: appId.value } according to the type definition
-    const res = await deployApp({ appId: appId.value })
-    console.log('Deploy response received (axios response):', res)
+    const res = await deployApp({ appId: safeParseId(appId.value) })
+    console.log('📦 Deploy response received (axios response):', res)
 
     // The backend's BaseResponse is nested in res.data
     const backendResponse = res.data
+    console.log('🔍 Backend response:', backendResponse)
 
-    if (backendResponse && typeof backendResponse.data === 'string') {
+    if (backendResponse && backendResponse.code === 0 && typeof backendResponse.data === 'string') {
       const deployUrl = backendResponse.data
       const finalUrl = `${deployUrl}?t=${new Date().getTime()}`
+
+      console.log('✅ Deploy successful! URL:', deployUrl)
+      console.log('🔗 Final preview URL:', finalUrl)
 
       previewUrl.value = finalUrl
       message.success('应用部署成功！')
@@ -326,6 +383,7 @@ const handleDeploy = async (): Promise<boolean> => {
         const urlParts = deployUrl.split('/').filter(Boolean)
         const deployKey = urlParts[urlParts.length - 1]
         app.value.data.deployKey = deployKey
+        console.log('💾 Updated deployKey:', deployKey)
       }
       return true
     } else {
@@ -334,6 +392,18 @@ const handleDeploy = async (): Promise<boolean> => {
         'Received (backend response):',
         backendResponse,
       )
+
+      // Special handling for Vue projects that might need more build time
+      if (codeFormat.value === 'vue_project' && backendResponse.message?.includes('Application code does not exist')) {
+        console.log('🔄 Vue project build might still be in progress, will retry in 15 seconds...')
+        message.warning('Vue项目可能还在构建中，15秒后自动重试部署...')
+        setTimeout(() => {
+          console.log('🔄 Retrying Vue project deployment...')
+          handleDeploy()
+        }, 15000)
+        return false
+      }
+
       message.error(`部署失败: ${backendResponse.message || '后端未返回有效的部署URL。'}`)
       return false
     }
@@ -341,7 +411,18 @@ const handleDeploy = async (): Promise<boolean> => {
     console.error('Deploy request failed:', error)
     const e = error as ErrorWithResponse
     const errorMessage = e.response?.data?.message || e.message || '未知网络错误'
-    message.error(`部署请求失败: ${errorMessage}`)
+
+    // 特殊处理认证错误
+    if (e.response?.data?.code === 40100) {
+      message.error('请先登录后再尝试部署')
+      // 可以考虑跳转到登录页面或显示登录弹窗
+    } else if (e.response?.data?.code === 40300) {
+      message.error('没有权限部署此应用')
+    } else {
+      message.error(`部署请求失败: ${errorMessage}`)
+    }
+
+    console.log('🔍 Full error response:', e.response?.data)
     return false
   } finally {
     isDeploying.value = false
@@ -370,9 +451,102 @@ const formatTime = (timestamp: number) => {
   return new Date(timestamp).toLocaleTimeString()
 }
 
+// Get tool display name
+const getToolDisplayName = (toolType: string) => {
+  const displayNames = {
+    'FILE_WRITE_SUCCESS': 'File written',
+    'FILE_WRITE_FAILED': 'Write failed',
+    'GENERATION_COMPLETE': 'Complete'
+  }
+  return displayNames[toolType] || toolType
+}
+
+// Safe ID conversion for large integers
+const safeParseId = (idStr: string): any => {
+  const parsed = parseInt(idStr)
+  if (Number.isSafeInteger(parsed)) {
+    return parsed
+  } else {
+    console.log('⚠️ Using string ID due to large integer:', idStr)
+    return idStr as any // Cast to any to bypass TypeScript type checking
+  }
+}
+
+
+// Streaming content buffer to handle partial tool calls
+const streamingBuffer = ref('')
+const pendingToolCalls = ref([])
+
+// Process streaming content with bracket detection
+const processStreamingContent = (newContent: string, currentAssistantMessage: any) => {
+  streamingBuffer.value += newContent
+  let displayContent = ''
+  let buffer = streamingBuffer.value
+  
+  // Look for complete tool call patterns
+  const toolCallRegex = /\[(FILE_WRITE_SUCCESS|FILE_WRITE_FAILED|GENERATION_COMPLETE)(?::([^\]]*))?\]/g
+  let lastProcessedIndex = 0
+  let match
+  
+  while ((match = toolCallRegex.exec(buffer)) !== null) {
+    // Add content before the tool call to display
+    displayContent += buffer.substring(lastProcessedIndex, match.index)
+    
+    // Extract tool call info
+    const [fullMatch, toolType, fileName] = match
+    const toolCall = {
+      type: toolType,
+      fileName: fileName ? fileName.trim() : null,
+      fullMatch: fullMatch
+    }
+    
+    // Add to pending tool calls
+    if (!pendingToolCalls.value.some(tc => tc.fullMatch === fullMatch)) {
+      pendingToolCalls.value.push(toolCall)
+    }
+    
+    lastProcessedIndex = match.index + fullMatch.length
+  }
+  
+  // Check if there's an incomplete bracket sequence at the end
+  const remainingBuffer = buffer.substring(lastProcessedIndex)
+  const openBracketIndex = remainingBuffer.lastIndexOf('[')
+  
+  if (openBracketIndex !== -1) {
+    // There might be an incomplete tool call, don't display from the '[' onwards
+    displayContent += remainingBuffer.substring(0, openBracketIndex)
+    streamingBuffer.value = '[' + remainingBuffer.substring(openBracketIndex + 1)
+  } else {
+    // No incomplete brackets, display everything
+    displayContent += remainingBuffer
+    streamingBuffer.value = ''
+  }
+  
+  return displayContent
+}
+
+// Simple tool call parsing for history messages
+const parseHistoryToolCalls = (content: string) => {
+  const toolCalls = []
+  const toolCallRegex = /\[(FILE_WRITE_SUCCESS|FILE_WRITE_FAILED|GENERATION_COMPLETE)(?::([^\]]*))?\]/g
+  let match
+  
+  while ((match = toolCallRegex.exec(content)) !== null) {
+    const [fullMatch, toolType, fileName] = match
+    toolCalls.push({
+      type: toolType,
+      fileName: fileName ? fileName.trim() : null,
+      fullMatch: fullMatch
+    })
+  }
+  
+  return toolCalls
+}
+
 // Load app on mount
 
 onMounted(() => {
+  console.log('🎯 Component mounted, starting loadApp()')
   loadApp()
   chatContainer.value?.addEventListener('scroll', debouncedHandleHistoryScroll)
   window.addEventListener('beforeunload', saveChatState)
@@ -439,6 +613,7 @@ watch(codeFormat, saveChatState)
               </div>
             </div>
             <div class="message-content">
+              <!-- Message Content -->
               <div
                 class="message-text"
                 v-if="message.content"
@@ -446,10 +621,29 @@ watch(codeFormat, saveChatState)
               ></div>
               <div
                 v-else-if="message.role === 'assistant' && isGenerating"
-                class="generating-content"
+                :class="['generating-content', { 'vue-project': codeFormat === 'vue_project' }]"
               >
-                <span class="typewriter-text">Synthesizing...</span>
+                <span class="typewriter-text">
+                  {{ codeFormat === 'vue_project' ? 'Building Vue project...' : 'Synthesizing...' }}
+                </span>
               </div>
+
+              <!-- Tool Calls Display -->
+              <div v-if="message.role === 'assistant' && message.toolCalls?.length > 0" class="inline-tool-calls">
+                <div v-for="(toolCall, idx) in message.toolCalls" :key="idx" class="inline-tool-item">
+                  <svg v-if="toolCall.type === 'FILE_WRITE_SUCCESS'" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="12" height="12" fill="currentColor" class="inline-tool-icon success">
+                    <path d="M9,20.42L2.79,14.21L5.62,11.38L9,14.77L18.88,4.88L21.71,7.71L9,20.42Z" />
+                  </svg>
+                  <svg v-else-if="toolCall.type === 'FILE_WRITE_FAILED'" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="12" height="12" fill="currentColor" class="inline-tool-icon error">
+                    <path d="M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z" />
+                  </svg>
+                  <svg v-else xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="12" height="12" fill="currentColor" class="inline-tool-icon complete">
+                    <path d="M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M12,17A5,5 0 0,1 7,12A5,5 0 0,1 12,7A5,5 0 0,1 17,12A5,5 0 0,1 12,17Z" />
+                  </svg>
+                  <span class="inline-tool-text">{{ toolCall.fileName || getToolDisplayName(toolCall.type) }}</span>
+                </div>
+              </div>
+
               <div class="message-time">{{ formatTime(message.timestamp) }}</div>
             </div>
           </div>
@@ -511,12 +705,14 @@ watch(codeFormat, saveChatState)
         <!-- Live Preview Area -->
         <div class="preview-content">
           <template v-if="previewUrl">
-            <iframe :src="previewUrl" frameborder="0" class="preview-iframe"></iframe>
+            <iframe
+              :src="previewUrl"
+              frameborder="0"
+              class="preview-iframe"
+              @load="console.log('🖼️ Iframe loaded successfully:', previewUrl)"
+              @error="console.log('❌ Iframe failed to load:', previewUrl)"
+            ></iframe>
           </template>
-          <div v-else-if="isGenerating" class="preview-generating">
-            <div class="animate-pulse text-neutral-400">Generating your app...</div>
-            <p>Generating your app...</p>
-          </div>
           <div v-else class="preview-placeholder">
             <svg
               xmlns="http://www.w3.org/2000/svg"
@@ -534,6 +730,7 @@ watch(codeFormat, saveChatState)
         </div>
       </div>
     </div>
+
   </div>
 </template>
 
@@ -633,25 +830,24 @@ watch(codeFormat, saveChatState)
 }
 
 .message-content {
-  background: rgba(247, 247, 248, 0.8);
-  backdrop-filter: blur(10px);
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  border-radius: 20px;
-  padding: 16px 20px;
+  background: var(--color-background-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-2xl);
+  padding: var(--space-4) var(--space-5);
   max-width: 100%;
   overflow-wrap: break-word;
   word-wrap: break-word;
   min-width: 0;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
-  transition: all 0.2s ease;
+  box-shadow: var(--shadow-xs);
+  transition: all var(--transition-normal);
+  animation: fadeInUp 0.3s ease-out;
 }
 
 .message.user .message-content {
-  background: linear-gradient(135deg, rgba(24, 160, 88, 0.95), rgba(54, 173, 106, 0.95));
-  backdrop-filter: blur(15px);
-  border: 1px solid rgba(255, 255, 255, 0.25);
-  color: #ffffff;
-  box-shadow: 0 4px 16px rgba(24, 160, 88, 0.12);
+  background: linear-gradient(135deg, var(--color-primary-500), var(--color-primary-600));
+  border: 1px solid var(--color-primary-400);
+  color: var(--color-text-inverse);
+  box-shadow: var(--shadow-sm);
 }
 
 .message-text {
@@ -661,14 +857,22 @@ watch(codeFormat, saveChatState)
   word-wrap: break-word;
 }
 
+.message-text.has-file-list-above {
+  margin-top: var(--space-2);
+}
+
 /* Hover effects for modern feel */
 .message-content:hover {
   transform: translateY(-1px);
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08);
+  box-shadow: var(--shadow-sm);
+  border-color: var(--color-border-strong);
 }
 
 .message.user .message-content:hover {
-  box-shadow: 0 6px 24px rgba(24, 160, 88, 0.18);
+  background: linear-gradient(135deg, var(--color-primary-600), var(--color-primary-700));
+  border-color: var(--color-primary-500);
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-md);
 }
 
 .message-time {
@@ -760,14 +964,19 @@ watch(codeFormat, saveChatState)
 .generating-content {
   display: flex;
   align-items: center;
-  color: #777;
-  font-size: 14px;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+  padding: var(--space-3);
+  background: var(--color-background-secondary);
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--color-border-light);
+  animation: pulse 2s ease-in-out infinite;
 }
 
 .typewriter-text {
-  color: rgba(0, 0, 0, 0.5);
+  color: var(--color-text-secondary);
   overflow: hidden;
-  border-right: 2px solid #18a058;
+  border-right: 2px solid var(--color-primary-500);
   white-space: nowrap;
   animation:
     typewriter 2s steps(15, end) infinite,
@@ -811,27 +1020,42 @@ watch(codeFormat, saveChatState)
 .input-wrapper {
   display: flex;
   align-items: center;
-  gap: 10px;
-  background: rgba(255, 255, 255, 0.3);
+  gap: var(--space-2);
+  background: var(--color-background-glass);
   -webkit-backdrop-filter: blur(8px) saturate(120%);
   backdrop-filter: blur(8px) saturate(120%);
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  border-radius: 16px;
-  padding: 8px 10px 8px 12px;
-  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.04);
-  transition:
-    background-color 0.2s ease,
-    box-shadow 0.2s ease,
-    border-color 0.2s ease;
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-xl);
+  padding: var(--space-2) var(--space-3);
+  box-shadow: var(--shadow-sm);
+  transition: all var(--transition-normal);
   width: 100%;
+  position: relative;
+  overflow: hidden;
+}
+
+.input-wrapper::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -100%;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
+  transition: left 0.5s ease;
+}
+
+.input-wrapper:hover::before {
+  left: 100%;
 }
 
 .input-wrapper:focus-within {
-  background: rgba(255, 255, 255, 0.8);
-  border-color: #10b981;
+  background: var(--color-background);
+  border-color: var(--color-primary-500);
   box-shadow:
-    0 0 0 2px rgba(16, 185, 129, 0.18),
-    0 6px 14px rgba(0, 0, 0, 0.06);
+    var(--shadow-md),
+    0 0 0 3px rgba(34, 197, 94, 0.1);
+  transform: translateY(-1px);
 }
 
 .chat-input {
@@ -861,21 +1085,54 @@ watch(codeFormat, saveChatState)
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: 9999px;
-  border: 1px solid #e5e7eb;
-  background: #ffffff;
-  color: #10b981;
-  transition:
-    background-color 0.15s ease,
-    border-color 0.15s ease,
-    opacity 0.2s ease;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--color-border);
+  background: var(--color-background);
+  color: var(--color-primary-600);
+  transition: all var(--transition-normal);
+  position: relative;
+  overflow: hidden;
 }
+
+.send-button::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 0;
+  height: 0;
+  background: var(--color-primary-100);
+  border-radius: var(--radius-full);
+  transition: all var(--transition-normal);
+  transform: translate(-50%, -50%);
+}
+
 .send-button:hover {
-  background: #f0fdf4;
-  border-color: #10b981;
+  background: var(--color-primary-50);
+  border-color: var(--color-primary-500);
+  transform: scale(1.05);
+  box-shadow: var(--shadow-md);
 }
+
+.send-button:hover::before {
+  width: 100%;
+  height: 100%;
+}
+
+.send-button:active {
+  transform: scale(0.95);
+}
+
 .send-button:disabled {
-  opacity: 0.55;
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.send-button:disabled:hover {
+  transform: none;
+  background: var(--color-background);
+  border-color: var(--color-border);
 }
 
 .preview-header {
@@ -925,6 +1182,7 @@ watch(codeFormat, saveChatState)
   height: 100%;
   color: #999;
 }
+
 
 .preview-placeholder p,
 .preview-generating p {
@@ -985,4 +1243,189 @@ watch(codeFormat, saveChatState)
   margin-bottom: 0.3em;
   color: white;
 }
+
+/* File write status in chat messages */
+.message-content.has-file-writes {
+  position: relative;
+  overflow: hidden;
+}
+
+.message-content.has-file-writes::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -4px;
+  width: 4px;
+  height: 100%;
+  background: linear-gradient(135deg, #10b981, #3b82f6);
+  border-radius: 0 2px 2px 0;
+  animation: file-write-glow 2s ease-in-out infinite;
+}
+
+@keyframes file-write-glow {
+  0%, 100% {
+    opacity: 0.6;
+    transform: scaleY(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scaleY(1.02);
+  }
+}
+
+/* File success list styling */
+.file-success-list {
+  margin-bottom: var(--space-3);
+  padding: var(--space-3);
+  background: var(--color-background);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-inset-sm);
+  animation: file-status-appear 0.5s ease-out;
+}
+
+.file-success-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+  font-weight: 600;
+  color: var(--color-text-primary);
+  font-size: var(--font-size-sm);
+}
+
+.file-icon {
+  color: var(--color-primary-500);
+}
+
+.file-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.file-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  background: var(--color-background-secondary);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+  transition: all var(--transition-fast);
+}
+
+.file-item:hover {
+  background: var(--color-primary-50);
+  color: var(--color-primary-700);
+}
+
+.check-icon {
+  color: var(--color-primary-500);
+  flex-shrink: 0;
+}
+
+.file-name {
+  font-family: 'Fira Code', 'Monaco', 'Consolas', monospace;
+  font-size: var(--font-size-xs);
+  word-break: break-all;
+}
+
+
+@keyframes file-status-appear {
+  0% {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* 简化的内联工具调用样式 */
+.inline-tool-calls {
+  margin: 8px 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.inline-tool-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  background: rgba(16, 185, 129, 0.1);
+  border: 1px solid rgba(16, 185, 129, 0.2);
+  border-radius: 8px;
+  font-size: 11px;
+  color: #065f46;
+  animation: tool-tag-appear 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+  transform-origin: left center;
+}
+
+.inline-tool-icon.success {
+  color: #22c55e;
+}
+
+.inline-tool-icon.error {
+  color: #ef4444;
+}
+
+.inline-tool-icon.complete {
+  color: #3b82f6;
+}
+
+.inline-tool-text {
+  font-family: 'Monaco', 'Consolas', monospace;
+  font-size: 10px;
+}
+
+
+@keyframes dot-bounce {
+  0%, 80%, 100% {
+    background: #d1d5db;
+    transform: scale(1);
+  }
+  40% {
+    background: #10b981;
+    transform: scale(1.2);
+  }
+}
+
+@keyframes tool-tag-appear {
+  0% {
+    opacity: 0;
+    transform: scale(0.8) translateX(-8px);
+  }
+  60% {
+    transform: scale(1.05) translateX(0);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1) translateX(0);
+  }
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes bounce {
+  from {
+    transform: translateY(0);
+  }
+  to {
+    transform: translateY(-4px);
+  }
+}
+
+
 </style>

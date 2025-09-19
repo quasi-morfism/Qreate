@@ -50,7 +50,16 @@ public class AppController {
     @Autowired
     private AiCodeGeneratorService aiCodeGeneratorService;
 
-    // 用户创建应用（需填写 initPrompt）
+    /**
+     * 用户创建应用（需填写 initPrompt）
+     * 
+     * 支持的代码生成类型 (codeGenType):
+     * - "HTML": 单页面HTML应用，适合简单的静态页面
+     * - "MULTI_FILE": 多文件项目，支持复杂的项目结构
+     * - "VUE_PROJECT": Vue.js项目，支持实时文件写入和组件化开发
+     * 
+     * 如果不指定 codeGenType，默认使用 "MULTI_FILE"
+     */
     @PostMapping("/add")
     public BaseResponse<Long> addApp(@RequestBody AppAddRequest addRequest, HttpServletRequest request) {
         ThrowUtils.throwIf(addRequest == null, ErrorCode.PARAMS_ERROR);
@@ -70,8 +79,10 @@ public class AppController {
             if (codeGenTypeEnum == null) {
                 // 无效值，使用默认值
                 app.setCodeGenType(CodeGenTypeEnum.MULTI_FILE.getValue());
+            } else {
+                // 如果是有效值，保持原值不变
+                app.setCodeGenType(codeGenType);
             }
-            // 如果是有效值，保持原值不变
         }
 
         // 如果未提供 appName，使用 AI 自动生成
@@ -222,23 +233,72 @@ public class AppController {
 
     /**
      * 应用聊天生成代码（流式 SSE）
+     * 
+     * 支持多种代码生成类型：
+     * - HTML: 单页面HTML代码生成
+     * - MULTI_FILE: 多文件项目代码生成  
+     * - VUE_PROJECT: Vue项目代码生成（带实时文件写入）
      *
      * @param appId   应用 ID
      * @param message 用户消息
      * @param request 请求对象
      * @return 生成结果流
+     * 
+     * SSE数据格式:
+     * - 普通响应: {"q": "AI生成的内容"}
+     * - 工具执行: {"q": "\n[TOOL_EXECUTED:writeFile:tool-id]"}
+     * - 文件写入成功: {"q": "\n[FILE_WRITE_SUCCESS:filename.vue]"}
+     * - 文件写入失败: {"q": "\n[FILE_WRITE_FAILED:filename.vue]"}
+     * - 生成完成: {"q": "\n[GENERATION_COMPLETE]"}
+     * - 流结束事件: event="done", data=""
+     * 
+     * 前端处理示例:
+     * ```javascript
+     * const eventSource = new EventSource('/app/chat/gen/code?appId=1&message=hello');
+     * eventSource.onmessage = function(event) {
+     *   const data = JSON.parse(event.data);
+     *   const content = data.q;
+     *   
+     *   if (content.includes('[FILE_WRITE_SUCCESS:')) {
+     *     // 处理文件写入成功
+     *     const fileName = content.match(/\[FILE_WRITE_SUCCESS:(.*?)\]/)[1];
+     *     console.log('文件写入成功:', fileName);
+     *   } else if (content.includes('[GENERATION_COMPLETE]')) {
+     *     // 处理生成完成
+     *     console.log('代码生成完成');
+     *   } else if (content.includes('[TOOL_EXECUTED:')) {
+     *     // 处理工具执行
+     *     console.log('工具执行:', content);
+     *   } else {
+     *     // 处理普通AI响应内容
+     *     displayMessage(content);
+     *   }
+     * };
+     * 
+     * eventSource.addEventListener('done', function(event) {
+     *   console.log('流传输完成');
+     *   eventSource.close();
+     * });
+     * ```
+     * 
+     * 注意事项:
+     * - 前端断开连接不会影响后台文件写入和聊天历史保存
+     * - Vue项目生成会通过工具调用实时写入文件
+     * - 聊天历史会在生成完成后自动保存
+     * - 支持多个前端同时订阅同一个流
      */
     @GetMapping(value = "/chat/gen/code", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public Flux<ServerSentEvent<String>> chatToGenCode(@RequestParam Long appId,
                                                        @RequestParam String message,
+                                                       @RequestParam(required = false) String adapt,
                                                        HttpServletRequest request) {
         // 参数校验
         ThrowUtils.throwIf(appId == null || appId <= 0, ErrorCode.PARAMS_ERROR, "应用ID无效");
         ThrowUtils.throwIf(StrUtil.isBlank(message), ErrorCode.PARAMS_ERROR, "用户消息不能为空");
         // 获取当前登录用户
         User loginUser = userService.getLoginUser(request);
-        // 调用服务生成代码（流式）
-        Flux<String> contentFlux = appService.chatToGenCode(appId, message, loginUser);
+        // 调用服务生成代码（流式），传递adapt参数
+        Flux<String> contentFlux = appService.chatToGenCode(appId, message, adapt, loginUser);
         return contentFlux
                 .map(chunk -> {
                     Map<String, String> wrapper = Map.of("q", chunk);

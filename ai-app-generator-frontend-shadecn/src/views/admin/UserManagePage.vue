@@ -237,7 +237,7 @@ async function saveUser() {
 async function confirmDelete(id: number | undefined) {
   if (!id) return
   if (confirm('Delete user?')) {
-    const res = await deleteUser({ id: id.toString() })
+    const res = await deleteUser({ id: id })
     if (res.data?.code === 0) {
       message.success('Deleted')
       fetchUsers()

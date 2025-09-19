@@ -6,7 +6,7 @@ declare namespace API {
   }
 
   type AppDeployRequest = {
-    appId?: string
+    appId?: number
   }
 
   type AppQueryRequest = {
@@ -14,30 +14,30 @@ declare namespace API {
     pageSize?: number
     sortField?: string
     sortOrder?: string
-    id?: string
+    id?: number
     appName?: string
     cover?: string
     initPrompt?: string
     codeGenType?: string
     deployKey?: string
     priority?: number
-    userId?: string
+    userId?: number
   }
 
   type AppUpdateAdminRequest = {
-    id?: string
+    id?: number
     appName?: string
     cover?: string
     priority?: number
   }
 
   type AppUpdateMyRequest = {
-    id?: string
+    id?: number
     appName?: string
   }
 
   type AppVO = {
-    id?: string
+    id?: number
     appName?: string
     cover?: string
     priority?: number
@@ -45,7 +45,7 @@ declare namespace API {
     codeGenType?: string
     deployKey?: string
     deployedTime?: string
-    userId?: string
+    userId?: number
     createTime?: string
     user?: UserVO
   }
@@ -76,7 +76,7 @@ declare namespace API {
 
   type BaseResponseLong = {
     code?: number
-    data?: string
+    data?: number
     message?: string
   }
 
@@ -160,7 +160,7 @@ declare namespace API {
   }
 
   type getAppVOByIdParams = {
-    id?: number
+    id: number
   }
 
   type getUserByIdParams = {
@@ -168,7 +168,7 @@ declare namespace API {
   }
 
   type getUserVOByIdParams = {
-    id?: number
+    id: number
   }
 
   type listAppChatHistoryParams = {
