@@ -4,6 +4,7 @@ export { formatDate, formatRelativeTime } from './date'
 export { getDefaultAvatar, getAvatarUrl } from './avatar'
 export { buildPreviewUrl, buildPreviewUrlWithCache, openPreview } from './deploy'
 export { createApiHandler, handleBatchApi } from './api'
+export { downloadAppCode } from './download'
 export * from './constants'
 
 // 类型定义

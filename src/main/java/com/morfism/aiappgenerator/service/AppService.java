@@ -98,4 +98,5 @@ public interface AppService extends IService<App> {
      */
     boolean deleteAppWithChatHistory(Long appId);
 
+    void generateAppScreenshotAsync(Long appId, String appUrl);
 }

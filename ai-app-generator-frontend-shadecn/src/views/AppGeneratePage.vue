@@ -8,7 +8,29 @@ import myAxios from '@/request'
 import { useLoginUserStore } from '@/stores/loginUser'
 import GlobalHeader from '@/components/layouts/GlobalHeader.vue'
 import { LoadingSpinner, UserAvatar } from '@/components/common'
-import { useMessage, buildPreviewUrlWithCache } from '@/utils'
+import { useMessage, buildPreviewUrlWithCache, downloadAppCode } from '@/utils'
+import { getStaticPreviewUrlWithCache } from '@/utils/staticPreview'
+import {
+  VisualEditor,
+  generateElementPrompt,
+  isInEditMode,
+  destroyEditor,
+} from '@/utils/visualAppEditor'
+import type { SelectedElement } from '@/utils/visualAppEditor'
+
+// Define interfaces for chat messages and tool calls
+interface ToolCall {
+  type: string
+  fileName: string | null
+  fullMatch: string
+}
+
+interface ChatMessage {
+  role: 'user' | 'assistant'
+  content: string
+  timestamp: number
+  toolCalls?: ToolCall[]
+}
 
 const route = useRoute()
 const router = useRouter()
@@ -26,13 +48,20 @@ const appId = ref<string>(route.params.id as string)
 const storageKey = ref<string>('')
 const app = ref<API.BaseResponseAppVO>({} as API.BaseResponseAppVO)
 const loading = ref(true)
-const messages = ref<Array<any>>([])
+const messages = ref<ChatMessage[]>([])
 const newMessage = ref('')
 const isGenerating = ref(false)
 const isDeploying = ref(false)
+const isDownloading = ref(false)
 const previewUrl = ref('')
+const iframeUrl = ref('')
 const chatContainer = ref<HTMLElement>()
 const eventSource = ref<EventSource | null>(null)
+const previewIframe = ref<HTMLIFrameElement>()
+const visualEditor = ref<VisualEditor | null>(null)
+const isVisualEditing = ref(false)
+const selectedElementInfo = ref<SelectedElement | null>(null)
+const hoveredElementInfo = ref<SelectedElement | null>(null)
 
 // Chat History State
 const historyLoading = ref(false)
@@ -41,9 +70,9 @@ const lastCreateTime = ref<string | undefined>()
 const PAGE_SIZE = 10
 
 // Debounce function
-const debounce = (func: Function, delay: number) => {
+const debounce = (func: (...args: unknown[]) => void, delay: number) => {
   let timeoutId: ReturnType<typeof setTimeout>
-  return (...args: any[]) => {
+  return (...args: unknown[]) => {
     clearTimeout(timeoutId)
     timeoutId = setTimeout(() => {
       func(...args)
@@ -52,7 +81,7 @@ const debounce = (func: Function, delay: number) => {
 }
 
 type ErrorWithResponse = {
-  response?: { data?: { message?: string, code?: number } }
+  response?: { data?: { message?: string; code?: number } }
   message?: string
 }
 
@@ -85,7 +114,15 @@ const loadChatState = (): boolean => {
     if (!raw) return false
     const state = JSON.parse(raw) as PersistedChatState
     if (typeof state?.newMessage === 'string') {
-      newMessage.value = state.newMessage
+      // 过滤掉包含元素提示的消息
+      if (
+        state.newMessage.includes('Please modify the following selected element:') ||
+        state.newMessage.includes('Selected element context:')
+      ) {
+        newMessage.value = ''
+      } else {
+        newMessage.value = state.newMessage
+      }
     }
     if (state?.codeFormat) {
       codeFormat.value = state.codeFormat
@@ -106,7 +143,7 @@ const loadChatHistory = async (cursor?: string) => {
   // Enforce a minimum display time for the spinner to avoid flickering
   const minSpinnerTime = new Promise((resolve) => setTimeout(resolve, 300))
   const historyPromise = listAppChatHistory({
-    appId: safeParseId(appId.value),
+    appId: appId.value,
     pageSize: PAGE_SIZE,
     lastCreateTime: cursor,
   })
@@ -125,8 +162,8 @@ const loadChatHistory = async (cursor?: string) => {
       hasMoreHistory.value = rawRecords.length === PAGE_SIZE
 
       // Reverse the records to display in ascending order (oldest first)
-      const historyRecords = rawRecords.reverse().map((item) => {
-        const message = {
+      const historyRecords = rawRecords.reverse().map((item): ChatMessage => {
+        const message: ChatMessage = {
           role: item.messageType === 'user' ? 'user' : 'assistant',
           content: item.message || '',
           timestamp: new Date(item.createTime as string).getTime(),
@@ -135,12 +172,11 @@ const loadChatHistory = async (cursor?: string) => {
         // Process tool calls for assistant messages
         if (message.role === 'assistant' && message.content) {
           // Parse tool calls from history
-          const toolCalls = parseHistoryToolCalls(message.content)
-          message.toolCalls = toolCalls
-          
+          message.toolCalls = parseHistoryToolCalls(message.content)
+
           // Remove tool call markers from display content
           let cleanContent = message.content
-          toolCalls.forEach(toolCall => {
+          message.toolCalls.forEach((toolCall) => {
             cleanContent = cleanContent.replace(toolCall.fullMatch, '')
           })
           message.content = cleanContent.trim()
@@ -180,7 +216,7 @@ const loadApp = async () => {
     }
 
     console.log('🔍 Requesting app with ID:', appId.value, 'type:', typeof appId.value)
-    const response = await getAppVoById({ id: safeParseId(appId.value) })
+    const response = await getAppVoById({ id: appId.value })
     const backend = response.data
     console.log('🔍 Backend response:', backend)
     if (backend?.code !== 0) {
@@ -214,7 +250,12 @@ const loadApp = async () => {
     // Set preview URL if app is deployed and has history
     if (appData?.deployKey && messages.value.length >= 2) {
       // Add timestamp to bust cache and force reload
-      previewUrl.value = `${buildPreviewUrlWithCache(appData.deployKey)}?t=${new Date().getTime()}`
+      previewUrl.value = buildPreviewUrlWithCache(appData.deployKey)
+      // Use static preview URL for iframe based on codeGenType and appId
+      iframeUrl.value = getStaticPreviewUrlWithCache(
+        appData.codeGenType || 'HTML',
+        appData.id?.toString() || '',
+      )
     }
   } catch (error) {
     console.error('Failed to load app:', error)
@@ -229,6 +270,13 @@ const sendMessage = async () => {
   if (!newMessage.value.trim() || isGenerating.value) {
     return
   }
+  // If in visual editing mode, prepare combined message for AI
+  let messageToSend = newMessage.value.trim()
+  if (isVisualEditing.value && selectedElementInfo.value) {
+    const elementPrompt = generateElementPrompt(selectedElementInfo.value)
+    // 组合用户输入和元素信息，但不修改输入框内容
+    messageToSend = `${elementPrompt}\n\nUser request: ${messageToSend}`
+  }
 
   if (!loginUserStore.loginUser.id) {
     message.error('Please log in to use the AI chat feature')
@@ -238,12 +286,19 @@ const sendMessage = async () => {
 
   const userMessage = {
     role: 'user' as const,
-    content: newMessage.value.trim(),
+    content: newMessage.value.trim(), // 显示用户原始输入
     timestamp: Date.now(),
   }
   messages.value.push(userMessage)
-  const currentMessage = newMessage.value
+  const currentMessage = messageToSend // 发送给AI的是组合后的消息
   newMessage.value = ''
+
+  // Immediately exit visual editing mode after sending message
+  if (isVisualEditing.value) {
+    visualEditor.value?.disableEditMode()
+    isVisualEditing.value = false
+    selectedElementInfo.value = null
+  }
 
   const assistantMessage = {
     role: 'assistant' as const,
@@ -282,16 +337,16 @@ const sendMessage = async () => {
       const newContent = data.q
       if (newContent && currentAssistantMessage) {
         // Process streaming content with bracket detection
-        const displayContent = processStreamingContent(newContent, currentAssistantMessage)
-        
+        const displayContent = processStreamingContent(newContent)
+
         // Add display content to message
         if (displayContent) {
           currentAssistantMessage.content += displayContent
         }
-        
+
         // Update tool calls
         currentAssistantMessage.toolCalls = [...pendingToolCalls.value]
-        
+
         scrollToBottom()
       }
     } catch (e) {
@@ -301,7 +356,7 @@ const sendMessage = async () => {
 
   eventSource.value.addEventListener('done', () => {
     console.log("SSE stream finished with 'done' event. Closing connection.")
-    
+
     // Process any remaining buffer content
     const currentAssistantMessage = messages.value.find(
       (m) => m.role === 'assistant' && m.timestamp === assistantMessageTimestamp,
@@ -309,11 +364,11 @@ const sendMessage = async () => {
     if (currentAssistantMessage && streamingBuffer.value) {
       currentAssistantMessage.content += streamingBuffer.value
     }
-    
+
     // Clear streaming state
     streamingBuffer.value = ''
     pendingToolCalls.value = []
-    
+
     isGenerating.value = false
     eventSource.value?.close()
     eventSource.value = null
@@ -352,6 +407,86 @@ const openInNewTab = (url: string | null) => {
   }
 }
 
+// Visual Editor
+const initVisualEditor = () => {
+  if (previewIframe.value && !visualEditor.value) {
+    const ve = new VisualEditor({
+      onElementSelected: (element) => {
+        selectedElementInfo.value = element
+        // 不自动填充到输入框，让用户自己输入描述
+      },
+      onElementHover: (element) => {
+        hoveredElementInfo.value = element
+      },
+    })
+    ve.init(previewIframe.value)
+    visualEditor.value = ve
+  }
+}
+
+const toggleVisualEditing = () => {
+  if (visualEditor.value) {
+    if (isInEditMode(visualEditor.value)) {
+      visualEditor.value.disableEditMode()
+      isVisualEditing.value = false
+      // 清除选中状态
+      selectedElementInfo.value = null
+    } else {
+      visualEditor.value.enableEditMode()
+      isVisualEditing.value = true
+    }
+  } else {
+    message.warning('请等待预览加载完成')
+  }
+}
+
+const onIframeLoad = () => {
+  console.log('🖼️ AppGeneratePage: Iframe load event fired.')
+  console.log('🔗 Iframe URL:', previewIframe.value?.src)
+
+  // 检查iframe中的脚本是否存在
+  try {
+    const iframeDoc = previewIframe.value?.contentDocument
+    if (iframeDoc) {
+      const scripts = iframeDoc.querySelectorAll('script')
+      console.log('📜 Scripts found in iframe:', scripts.length)
+      const hasVisualEditor = Array.from(scripts).some((script) =>
+        script.textContent?.includes('VisualEditor Inject'),
+      )
+      console.log('🎯 Visual editor script found:', hasVisualEditor)
+
+      // 检查全局变量（避免直接访问未声明的 window 扩展属性）
+      const win = iframeDoc.defaultView as unknown as Record<string, unknown> | null
+      const hasInit = Boolean(win && win['__visualEditorInitialized'])
+      console.log('🔧 Visual editor initialized:', hasInit)
+    } else {
+      console.log('❌ Cannot access iframe document (cross-origin)')
+    }
+  } catch (error) {
+    const e = error as Error
+    console.log('❌ Error accessing iframe:', e.message)
+  }
+
+  initVisualEditor()
+}
+
+// Download app code
+const handleDownload = async () => {
+  if (isDownloading.value || !appId.value) return
+
+  isDownloading.value = true
+  try {
+    await downloadAppCode(appId.value)
+    message.success('代码下载成功！')
+  } catch (error) {
+    console.error('Download error:', error)
+    const err = error as Error
+    message.error(err.message || '代码下载失败')
+  } finally {
+    isDownloading.value = false
+  }
+}
+
 // Deploy app
 const handleDeploy = async (): Promise<boolean> => {
   if (!appId.value) {
@@ -362,7 +497,7 @@ const handleDeploy = async (): Promise<boolean> => {
   console.log(`🚀 Starting deployment for app ID: ${appId.value}`)
   try {
     // The parameter should be { appId: appId.value } according to the type definition
-    const res = await deployApp({ appId: safeParseId(appId.value) })
+    const res = await deployApp({ appId: appId.value })
     console.log('📦 Deploy response received (axios response):', res)
 
     // The backend's BaseResponse is nested in res.data
@@ -371,7 +506,7 @@ const handleDeploy = async (): Promise<boolean> => {
 
     if (backendResponse && backendResponse.code === 0 && typeof backendResponse.data === 'string') {
       const deployUrl = backendResponse.data
-      const finalUrl = `${deployUrl}?t=${new Date().getTime()}`
+      const finalUrl = buildPreviewUrlWithCache(deployUrl)
 
       console.log('✅ Deploy successful! URL:', deployUrl)
       console.log('🔗 Final preview URL:', finalUrl)
@@ -383,6 +518,11 @@ const handleDeploy = async (): Promise<boolean> => {
         const urlParts = deployUrl.split('/').filter(Boolean)
         const deployKey = urlParts[urlParts.length - 1]
         app.value.data.deployKey = deployKey
+        // Use static preview URL for iframe based on codeGenType and appId
+        iframeUrl.value = getStaticPreviewUrlWithCache(
+          app.value.data.codeGenType || 'HTML',
+          app.value.data.id?.toString() || '',
+        )
         console.log('💾 Updated deployKey:', deployKey)
       }
       return true
@@ -394,7 +534,10 @@ const handleDeploy = async (): Promise<boolean> => {
       )
 
       // Special handling for Vue projects that might need more build time
-      if (codeFormat.value === 'vue_project' && backendResponse.message?.includes('Application code does not exist')) {
+      if (
+        codeFormat.value === 'vue_project' &&
+        backendResponse.message?.includes('Application code does not exist')
+      ) {
         console.log('🔄 Vue project build might still be in progress, will retry in 15 seconds...')
         message.warning('Vue项目可能还在构建中，15秒后自动重试部署...')
         setTimeout(() => {
@@ -454,64 +597,53 @@ const formatTime = (timestamp: number) => {
 // Get tool display name
 const getToolDisplayName = (toolType: string) => {
   const displayNames = {
-    'FILE_WRITE_SUCCESS': 'File written',
-    'FILE_WRITE_FAILED': 'Write failed',
-    'GENERATION_COMPLETE': 'Complete'
+    FILE_WRITE_SUCCESS: 'File written',
+    FILE_WRITE_FAILED: 'Write failed',
+    GENERATION_COMPLETE: 'Complete',
   }
-  return displayNames[toolType] || toolType
+  return displayNames[toolType as keyof typeof displayNames] || toolType
 }
-
-// Safe ID conversion for large integers
-const safeParseId = (idStr: string): any => {
-  const parsed = parseInt(idStr)
-  if (Number.isSafeInteger(parsed)) {
-    return parsed
-  } else {
-    console.log('⚠️ Using string ID due to large integer:', idStr)
-    return idStr as any // Cast to any to bypass TypeScript type checking
-  }
-}
-
 
 // Streaming content buffer to handle partial tool calls
 const streamingBuffer = ref('')
-const pendingToolCalls = ref([])
+const pendingToolCalls = ref<ToolCall[]>([])
 
 // Process streaming content with bracket detection
-const processStreamingContent = (newContent: string, currentAssistantMessage: any) => {
+const processStreamingContent = (newContent: string) => {
   streamingBuffer.value += newContent
   let displayContent = ''
-  let buffer = streamingBuffer.value
-  
+  const buffer = streamingBuffer.value
+
   // Look for complete tool call patterns
-  const toolCallRegex = /\[(FILE_WRITE_SUCCESS|FILE_WRITE_FAILED|GENERATION_COMPLETE)(?::([^\]]*))?\]/g
+  const toolCallRegex =
+    /\[(FILE_WRITE_SUCCESS|FILE_WRITE_FAILED|GENERATION_COMPLETE)(?::([^\]]*))?\]/g
   let lastProcessedIndex = 0
   let match
-  
+
   while ((match = toolCallRegex.exec(buffer)) !== null) {
     // Add content before the tool call to display
     displayContent += buffer.substring(lastProcessedIndex, match.index)
-    
+
     // Extract tool call info
     const [fullMatch, toolType, fileName] = match
     const toolCall = {
       type: toolType,
       fileName: fileName ? fileName.trim() : null,
-      fullMatch: fullMatch
+      fullMatch: fullMatch,
     }
-    
+
     // Add to pending tool calls
-    if (!pendingToolCalls.value.some(tc => tc.fullMatch === fullMatch)) {
+    if (!pendingToolCalls.value.some((tc) => tc.fullMatch === fullMatch)) {
       pendingToolCalls.value.push(toolCall)
     }
-    
+
     lastProcessedIndex = match.index + fullMatch.length
   }
-  
+
   // Check if there's an incomplete bracket sequence at the end
   const remainingBuffer = buffer.substring(lastProcessedIndex)
   const openBracketIndex = remainingBuffer.lastIndexOf('[')
-  
+
   if (openBracketIndex !== -1) {
     // There might be an incomplete tool call, don't display from the '[' onwards
     displayContent += remainingBuffer.substring(0, openBracketIndex)
@@ -521,32 +653,34 @@ const processStreamingContent = (newContent: string, currentAssistantMessage: an
     displayContent += remainingBuffer
     streamingBuffer.value = ''
   }
-  
+
   return displayContent
 }
 
 // Simple tool call parsing for history messages
-const parseHistoryToolCalls = (content: string) => {
-  const toolCalls = []
-  const toolCallRegex = /\[(FILE_WRITE_SUCCESS|FILE_WRITE_FAILED|GENERATION_COMPLETE)(?::([^\]]*))?\]/g
+const parseHistoryToolCalls = (content: string): ToolCall[] => {
+  const toolCalls: ToolCall[] = []
+  const toolCallRegex =
+    /\[(FILE_WRITE_SUCCESS|FILE_WRITE_FAILED|GENERATION_COMPLETE)(?::([^\]]*))?\]/g
   let match
-  
+
   while ((match = toolCallRegex.exec(content)) !== null) {
     const [fullMatch, toolType, fileName] = match
     toolCalls.push({
       type: toolType,
       fileName: fileName ? fileName.trim() : null,
-      fullMatch: fullMatch
+      fullMatch: fullMatch,
     })
   }
-  
+
   return toolCalls
 }
 
 // Load app on mount
 
 onMounted(() => {
-  console.log('🎯 Component mounted, starting loadApp()')
+  // 确保初始状态下没有选中的元素
+  selectedElementInfo.value = null
   loadApp()
   chatContainer.value?.addEventListener('scroll', debouncedHandleHistoryScroll)
   window.addEventListener('beforeunload', saveChatState)
@@ -556,6 +690,9 @@ onUnmounted(() => {
   if (eventSource.value) {
     eventSource.value.close()
   }
+  if (visualEditor.value) {
+    destroyEditor(visualEditor.value)
+  }
   chatContainer.value?.removeEventListener('scroll', debouncedHandleHistoryScroll)
   window.removeEventListener('beforeunload', saveChatState)
 })
@@ -563,6 +700,26 @@ onUnmounted(() => {
 // Persist on changes
 watch(newMessage, saveChatState)
 watch(codeFormat, saveChatState)
+
+const clearSelectedElement = () => {
+  selectedElementInfo.value = null
+  visualEditor.value?.clearSelection()
+}
+
+// Handle Enter key with Chinese IME support
+const handleEnterKey = (event: KeyboardEvent) => {
+  // Check if IME is composing (Chinese input method is active)
+  if (event.isComposing || event.keyCode === 229) {
+    // Don't prevent default behavior during IME composition
+    return
+  }
+
+  // Prevent default Enter behavior (new line)
+  event.preventDefault()
+
+  // Only send message if not composing
+  sendMessage()
+}
 </script>
 
 <template>
@@ -629,18 +786,59 @@ watch(codeFormat, saveChatState)
               </div>
 
               <!-- Tool Calls Display -->
-              <div v-if="message.role === 'assistant' && message.toolCalls?.length > 0" class="inline-tool-calls">
-                <div v-for="(toolCall, idx) in message.toolCalls" :key="idx" class="inline-tool-item">
-                  <svg v-if="toolCall.type === 'FILE_WRITE_SUCCESS'" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="12" height="12" fill="currentColor" class="inline-tool-icon success">
-                    <path d="M9,20.42L2.79,14.21L5.62,11.38L9,14.77L18.88,4.88L21.71,7.71L9,20.42Z" />
+              <div
+                v-if="
+                  message.role === 'assistant' && message.toolCalls && message.toolCalls.length > 0
+                "
+                class="inline-tool-calls"
+              >
+                <div
+                  v-for="(toolCall, idx) in message.toolCalls"
+                  :key="idx"
+                  class="inline-tool-item"
+                >
+                  <svg
+                    v-if="toolCall.type === 'FILE_WRITE_SUCCESS'"
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 24 24"
+                    width="12"
+                    height="12"
+                    fill="currentColor"
+                    class="inline-tool-icon success"
+                  >
+                    <path
+                      d="M9,20.42L2.79,14.21L5.62,11.38L9,14.77L18.88,4.88L21.71,7.71L9,20.42Z"
+                    />
                   </svg>
-                  <svg v-else-if="toolCall.type === 'FILE_WRITE_FAILED'" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="12" height="12" fill="currentColor" class="inline-tool-icon error">
-                    <path d="M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z" />
+                  <svg
+                    v-else-if="toolCall.type === 'FILE_WRITE_FAILED'"
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 24 24"
+                    width="12"
+                    height="12"
+                    fill="currentColor"
+                    class="inline-tool-icon error"
+                  >
+                    <path
+                      d="M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z"
+                    />
                   </svg>
-                  <svg v-else xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="12" height="12" fill="currentColor" class="inline-tool-icon complete">
-                    <path d="M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M12,17A5,5 0 0,1 7,12A5,5 0 0,1 12,7A5,5 0 0,1 17,12A5,5 0 0,1 12,17Z" />
+                  <svg
+                    v-else
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 24 24"
+                    width="12"
+                    height="12"
+                    fill="currentColor"
+                    class="inline-tool-icon complete"
+                  >
+                    <path
+                      d="M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M12,17A5,5 0 0,1 7,12A5,5 0 0,1 12,7A5,5 0 0,1 17,12A5,5 0 0,1 12,17Z"
+                    />
                   </svg>
-                  <span class="inline-tool-text">{{ toolCall.fileName || getToolDisplayName(toolCall.type) }}</span>
+                  <span class="inline-tool-text">{{
+                    toolCall.fileName || getToolDisplayName(toolCall.type)
+                  }}</span>
                 </div>
               </div>
 
@@ -650,14 +848,54 @@ watch(codeFormat, saveChatState)
         </div>
         <!-- Chat Input Area -->
         <div class="chat-input-area">
+          <div v-if="isVisualEditing && selectedElementInfo" class="selected-hint-bar">
+            <div class="hint-left">
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 24 24"
+                width="14"
+                height="14"
+                fill="currentColor"
+              >
+                <path
+                  d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34a.9959.9959 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"
+                />
+              </svg>
+              <span class="hint-title">Selected Element</span>
+            </div>
+            <div class="hint-content">
+              <span class="tag">&lt;{{ selectedElementInfo.tagName }}&gt;</span>
+              <span v-if="selectedElementInfo.id" class="id">#{{ selectedElementInfo.id }}</span>
+              <span v-if="selectedElementInfo.className" class="classes">{{
+                selectedElementInfo.className
+                  .split(' ')
+                  .slice(0, 2)
+                  .map((c) => '.' + c)
+                  .join(' ')
+              }}</span>
+            </div>
+            <button class="hint-close" @click="clearSelectedElement" title="Clear selection">
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 24 24"
+                width="14"
+                height="14"
+                fill="currentColor"
+              >
+                <path
+                  d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+                />
+              </svg>
+            </button>
+          </div>
           <div class="input-wrapper">
             <!-- format is controlled from Home page. No selector here. -->
             <textarea
               v-model="newMessage"
               rows="1"
-              placeholder="Describe the app you want to build..."
+              placeholder="Tell me what you want to build..."
               class="chat-input"
-              @keydown.enter.prevent="sendMessage"
+              @keydown.enter="handleEnterKey"
             />
             <button
               :disabled="isGenerating || !newMessage.trim()"
@@ -681,22 +919,86 @@ watch(codeFormat, saveChatState)
       <!-- Preview Section -->
       <div class="preview-section">
         <div class="preview-header">
-          <div style="font-weight: 700; font-size: 16px">Live Preview</div>
+          <div class="preview-title-section">
+            <div class="preview-title">Live Preview</div>
+          </div>
           <div class="preview-header-actions">
-            <a
-              :href="previewUrl || '#'"
-              target="_blank"
-              @click.prevent="openInNewTab(previewUrl)"
-              class="text-sm text-emerald-700 disabled:opacity-50 link-button"
-              :class="{ 'pointer-events-none opacity-50': !previewUrl }"
-              >Open in New Tab</a
-            >
             <button
-              class="px-3 py-1 rounded-md bg-emerald-600 text-white text-sm disabled:opacity-50"
+              @click="toggleVisualEditing"
+              class="visual-edit-button header-icon-btn expanding"
+              :class="{ active: isVisualEditing }"
+              :title="isVisualEditing ? 'Exit Visual Edit Mode' : 'Enter Visual Edit Mode'"
+              :disabled="!previewUrl"
+            >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 24 24"
+                width="16"
+                height="16"
+                fill="currentColor"
+              >
+                <path
+                  v-if="!isVisualEditing"
+                  d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34a.9959.9959 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"
+                />
+                <path
+                  v-else
+                  d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+                />
+              </svg>
+              <span class="btn-label">{{ isVisualEditing ? 'Exit Edit' : 'Visual Edit' }}</span>
+            </button>
+            <button
+              :disabled="!previewUrl"
+              @click="openInNewTab(previewUrl)"
+              class="preview-action-btn preview-btn header-icon-btn expanding"
+            >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 24 24"
+                width="16"
+                height="16"
+                fill="currentColor"
+              >
+                <path
+                  d="M14,3V5H17.59L7.76,14.83L9.17,16.24L19,6.41V10H21V3M19,19H5V5H12V3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V12H19V19Z"
+                />
+              </svg>
+              <span class="btn-label">Preview</span>
+            </button>
+            <button
+              class="preview-action-btn download-btn header-icon-btn expanding"
+              :disabled="isDownloading"
+              @click="handleDownload"
+            >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 24 24"
+                width="16"
+                height="16"
+                fill="currentColor"
+              >
+                <path d="M5,20H19V18H5M19,9H15V3H9V9H5L12,16L19,9Z" />
+              </svg>
+              <span class="btn-label">{{ isDownloading ? 'Downloading…' : 'Download' }}</span>
+            </button>
+            <button
+              class="preview-action-btn deploy-btn header-icon-btn expanding"
               :disabled="isDeploying"
               @click="handleDeploy"
             >
-              {{ app.data?.deployKey ? 'Deploy' : 'Deploy' }}
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 24 24"
+                width="16"
+                height="16"
+                fill="currentColor"
+              >
+                <path
+                  d="M12,1L21,5V11C21,16.55 17.16,21.74 12,23C6.84,21.74 3,16.55 3,11V5L12,1M12,7C10.89,7 10,7.89 10,9A2,2 0 0,0 12,11A2,2 0 0,0 14,9C14,7.89 13.11,7 12,7Z"
+                />
+              </svg>
+              <span class="btn-label">{{ isDeploying ? 'Deploying…' : 'Deploy' }}</span>
             </button>
           </div>
         </div>
@@ -704,13 +1006,14 @@ watch(codeFormat, saveChatState)
 
         <!-- Live Preview Area -->
         <div class="preview-content">
-          <template v-if="previewUrl">
+          <template v-if="iframeUrl">
             <iframe
-              :src="previewUrl"
+              ref="previewIframe"
+              :src="iframeUrl"
               frameborder="0"
               class="preview-iframe"
-              @load="console.log('🖼️ Iframe loaded successfully:', previewUrl)"
-              @error="console.log('❌ Iframe failed to load:', previewUrl)"
+              @load="onIframeLoad"
+              @error="console.log('❌ Iframe failed to load:', iframeUrl)"
             ></iframe>
           </template>
           <div v-else class="preview-placeholder">
@@ -730,7 +1033,6 @@ watch(codeFormat, saveChatState)
         </div>
       </div>
     </div>
-
   </div>
 </template>
 
@@ -1006,6 +1308,8 @@ watch(codeFormat, saveChatState)
   }
 }
 
+/* Selected element info styles are now managed in visualEditor.ts */
+
 /* New Minimalist Chat Input Styling */
 .chat-input-area {
   position: absolute;
@@ -1015,6 +1319,7 @@ watch(codeFormat, saveChatState)
   padding: 0;
   border-top: none;
   background-color: transparent;
+  z-index: 20;
 }
 
 .input-wrapper {
@@ -1097,26 +1402,21 @@ watch(codeFormat, saveChatState)
 .send-button::before {
   content: '';
   position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 0;
-  height: 0;
-  background: var(--color-primary-100);
-  border-radius: var(--radius-full);
-  transition: all var(--transition-normal);
-  transform: translate(-50%, -50%);
+  inset: 0;
+  background: var(--color-primary-50);
+  opacity: 0;
+  transition: opacity var(--transition-normal);
 }
 
 .send-button:hover {
-  background: var(--color-primary-50);
+  background: var(--color-background);
   border-color: var(--color-primary-500);
-  transform: scale(1.05);
-  box-shadow: var(--shadow-md);
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-sm);
 }
 
 .send-button:hover::before {
-  width: 100%;
-  height: 100%;
+  opacity: 0.15; /* softer glow and will not obscure icon */
 }
 
 .send-button:active {
@@ -1135,35 +1435,281 @@ watch(codeFormat, saveChatState)
   border-color: var(--color-border);
 }
 
+/* Selected hint bar - matching chat input style with yellow highlight */
+.selected-hint-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 12px);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: var(--space-2) var(--space-3);
+  background: rgba(254, 249, 230, 0.85);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+  color: #92400e;
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-sm);
+  -webkit-backdrop-filter: blur(8px) saturate(120%);
+  backdrop-filter: blur(8px) saturate(120%);
+  z-index: 30;
+  font-size: 13px;
+  font-weight: 500;
+  transition: all var(--transition-normal);
+}
+
+.selected-hint-bar:hover {
+  box-shadow: var(--shadow-md);
+  transform: translateY(-1px);
+}
+
+.selected-hint-bar .hint-left {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  color: #92400e;
+}
+
+.selected-hint-bar .hint-left svg {
+  color: #d97706;
+}
+
+.selected-hint-bar .hint-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.selected-hint-bar .hint-content {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  flex: 1;
+  justify-content: center;
+}
+
+.selected-hint-bar .tag {
+  background: rgba(146, 64, 14, 0.1);
+  color: #a16207;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: 'Monaco', 'Consolas', 'Courier New', monospace;
+  font-weight: 400;
+  font-size: 11px;
+  border: 1px solid rgba(146, 64, 14, 0.2);
+}
+
+.selected-hint-bar .id {
+  background: rgba(146, 64, 14, 0.1);
+  color: #a16207;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: 'Monaco', 'Consolas', 'Courier New', monospace;
+  font-weight: 400;
+  font-size: 11px;
+  border: 1px solid rgba(146, 64, 14, 0.2);
+}
+
+.selected-hint-bar .classes {
+  background: rgba(146, 64, 14, 0.1);
+  color: #a16207;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: 'Monaco', 'Consolas', 'Courier New', monospace;
+  font-weight: 400;
+  font-size: 11px;
+  border: 1px solid rgba(146, 64, 14, 0.2);
+}
+
+.selected-hint-bar .hint-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 1px solid #f59e0b;
+  background: #fef3c7;
+  color: #92400e;
+  cursor: pointer;
+  border-radius: 6px;
+  transition: all 0.15s ease;
+  flex-shrink: 0;
+}
+
+.selected-hint-bar .hint-close:hover {
+  background: #fed7aa;
+  border-color: #d97706;
+  color: #7c2d12;
+  transform: scale(1.05);
+}
+
+@media (max-width: 768px) {
+  .selected-hint-bar {
+    left: 0;
+    right: 0;
+    padding: 6px 10px;
+    gap: 8px;
+  }
+
+  .selected-hint-bar .hint-content {
+    gap: 6px;
+  }
+}
+
 .preview-header {
-  padding: 12px 16px;
-  border-bottom: 1px solid #efefef;
+  padding: 16px 20px;
+  border-bottom: 1px solid #f0f0f0;
   display: flex;
   justify-content: space-between;
   align-items: center;
   flex-shrink: 0;
-  border-radius: 20px 20px 0 0; /* Match parent's top corners */
+  border-radius: 20px 20px 0 0;
+  background: linear-gradient(135deg, #fafafa 0%, #ffffff 100%);
+  backdrop-filter: blur(10px);
 }
 
-.preview-header h3 {
-  margin: 0;
-  font-size: 16px;
-  font-weight: 600;
+.preview-title-section {
+  display: flex;
+  align-items: center;
+  gap: 16px;
 }
+
+.preview-title {
+  font-weight: 700;
+  font-size: 18px;
+  color: #1f2937;
+  background: linear-gradient(135deg, #1f2937, #4b5563);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* Visual Editor Button styles are now managed in visualEditor.ts */
 
 .preview-header-actions {
   display: flex;
-  gap: 12px;
+  gap: 10px;
   align-items: center;
 }
 
-.preview-header-actions :deep(.n-button--text-type) {
-  border-radius: 20px;
+.header-icon-btn {
+  height: 36px;
+  padding: 0 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  width: 36px;
+  overflow: hidden;
+  gap: 0;
+  transition:
+    width 0.18s ease,
+    background-color 0.18s ease,
+    border-color 0.18s ease;
 }
 
-.preview-header-actions :deep(.n-button--primary-type) {
-  border-radius: 20px;
-  box-shadow: 0 6px 16px rgba(24, 160, 88, 0.22);
+.header-icon-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+/* Ensure icon is always visible even before hover */
+.header-icon-btn svg {
+  opacity: 1;
+}
+
+.header-icon-btn .btn-label {
+  margin-left: 0;
+  white-space: nowrap;
+  opacity: 0;
+  transform: translateX(-6px);
+  max-width: 0;
+  overflow: hidden;
+  transition:
+    opacity 0.18s ease,
+    transform 0.18s ease;
+}
+
+.header-icon-btn.expanding:hover,
+.header-icon-btn.expanding:focus-within {
+  width: 110px;
+  justify-content: flex-start;
+  gap: 8px;
+}
+
+.header-icon-btn.expanding:hover .btn-label,
+.header-icon-btn.expanding:focus-within .btn-label {
+  opacity: 1;
+  transform: translateX(0);
+  max-width: 80px;
+}
+
+.preview-action-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  transition: all 0.2s ease;
+  cursor: pointer;
+  border: 1px solid transparent;
+  background: #ffffff;
+  color: #374151;
+}
+
+/* Ensure icon-only buttons stay perfectly centered at rest */
+.preview-action-btn.header-icon-btn {
+  gap: 0;
+  padding: 0 8px;
+}
+
+.preview-action-btn.header-icon-btn.expanding:hover,
+.preview-action-btn.header-icon-btn.expanding:focus-within {
+  gap: 8px;
+}
+
+.preview-action-btn:hover {
+  opacity: 0.8;
+}
+
+.preview-btn {
+  border-color: #10b981;
+  color: #065f46;
+}
+
+.preview-btn:hover {
+  background-color: #f0fdf4;
+  border-color: #059669;
+}
+
+.download-btn {
+  border-color: #3b82f6;
+  color: #1e40af;
+}
+
+.download-btn:hover {
+  background-color: #eff6ff;
+  border-color: #2563eb;
+}
+
+.deploy-btn {
+  background: #10b981;
+  border-color: #10b981;
+  color: white;
+}
+
+.deploy-btn:hover {
+  background: #059669;
+  border-color: #059669;
+}
+
+.preview-action-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .preview-content {
@@ -1182,7 +1728,6 @@ watch(codeFormat, saveChatState)
   height: 100%;
   color: #999;
 }
-
 
 .preview-placeholder p,
 .preview-generating p {
@@ -1263,7 +1808,8 @@ watch(codeFormat, saveChatState)
 }
 
 @keyframes file-write-glow {
-  0%, 100% {
+  0%,
+  100% {
     opacity: 0.6;
     transform: scaleY(1);
   }
@@ -1332,7 +1878,6 @@ watch(codeFormat, saveChatState)
   word-break: break-all;
 }
 
-
 @keyframes file-status-appear {
   0% {
     opacity: 0;
@@ -1383,9 +1928,10 @@ watch(codeFormat, saveChatState)
   font-size: 10px;
 }
 
-
 @keyframes dot-bounce {
-  0%, 80%, 100% {
+  0%,
+  80%,
+  100% {
     background: #d1d5db;
     transform: scale(1);
   }
@@ -1427,5 +1973,28 @@ watch(codeFormat, saveChatState)
   }
 }
 
+/* Removed visual editor selected-element overlay styles to restore original UI */
 
+/* Enhanced visual feedback for input focus */
+
+/* Add responsive behavior for smaller screens */
+@media (max-width: 768px) {
+  .selected-element-info {
+    left: 8px;
+    right: 8px;
+  }
+
+  .element-card {
+    padding: 12px;
+  }
+
+  .element-title {
+    font-size: 14px;
+  }
+
+  .detail-label {
+    min-width: 50px;
+    font-size: 11px;
+  }
+}
 </style>

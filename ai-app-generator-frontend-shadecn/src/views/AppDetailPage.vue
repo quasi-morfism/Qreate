@@ -3,7 +3,7 @@ import { ref, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { getAppVoById, deleteMyApp, deployApp } from '@/api/appController'
 import { useLoginUserStore } from '@/stores/loginUser'
-import { useMessage, formatDate, openPreview } from '@/utils'
+import { useMessage, formatDate, openPreview, downloadAppCode } from '@/utils'
 
 const route = useRoute()
 const router = useRouter()
@@ -16,6 +16,7 @@ const app = ref<API.AppVO>({})
 const loading = ref(true)
 const isDeploying = ref(false)
 const isDeleting = ref(false)
+const isDownloading = ref(false)
 
 // Load app data
 const loadApp = async () => {
@@ -99,6 +100,22 @@ const handleDelete = async () => {
   }
 }
 
+// Download app code
+const handleDownload = async () => {
+  if (isDownloading.value || !appId.value) return
+
+  isDownloading.value = true
+  try {
+    await downloadAppCode(appId.value)
+    message.success('Code downloaded successfully!')
+  } catch (error: any) {
+    console.error('Download error:', error)
+    message.error(error.message || 'Failed to download code')
+  } finally {
+    isDownloading.value = false
+  }
+}
+
 // Preview app
 const previewApp = async () => {
   // If already deployed, just open the URL
@@ -138,7 +155,6 @@ const previewApp = async () => {
     message.error('Failed to deploy app for preview')
   }
 }
-
 
 onMounted(() => {
   loadApp()
@@ -256,6 +272,26 @@ onMounted(() => {
             @click="handleDeploy"
           >
             {{ app.deployedTime ? 'Redeploy' : 'Deploy' }}
+          </button>
+
+          <button
+            class="px-4 py-3 rounded-md border border-blue-600 text-blue-700 disabled:opacity-50"
+            :disabled="isDownloading"
+            @click="handleDownload"
+          >
+            <span style="display: inline-flex; align-items: center; gap: 6px">
+              <svg
+                v-if="!isDownloading"
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="currentColor"
+              >
+                <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z" />
+              </svg>
+              <span v-if="isDownloading">Downloading...</span>
+              <span v-else>Download</span>
+            </span>
           </button>
 
           <button class="px-4 py-3 rounded-md border" @click="previewApp">Preview</button>
