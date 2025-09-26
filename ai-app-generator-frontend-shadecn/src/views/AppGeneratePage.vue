@@ -10,6 +10,7 @@ import GlobalHeader from '@/components/layouts/GlobalHeader.vue'
 import { LoadingSpinner, UserAvatar } from '@/components/common'
 import { useMessage, buildPreviewUrlWithCache, downloadAppCode } from '@/utils'
 import { getStaticPreviewUrlWithCache } from '@/utils/staticPreview'
+import { initToolsConfig, generateToolCallRegex, getToolIcon, getToolDisplayName } from '@/utils/toolConfig'
 import {
   VisualEditor,
   generateElementPrompt,
@@ -169,17 +170,28 @@ const loadChatHistory = async (cursor?: string) => {
           timestamp: new Date(item.createTime as string).getTime(),
         }
 
-        // Process tool calls for assistant messages
+        // Process tool calls for assistant messages with inline display
         if (message.role === 'assistant' && message.content) {
-          // Parse tool calls from history
+          // Parse tool calls from history for tracking
           message.toolCalls = parseHistoryToolCalls(message.content)
 
-          // Remove tool call markers from display content
-          let cleanContent = message.content
+          // Convert tool call markers to inline HTML elements for display
+          let processedContent = message.content
           message.toolCalls.forEach((toolCall) => {
-            cleanContent = cleanContent.replace(toolCall.fullMatch, '')
+            const toolIcon = getToolIcon(toolCall.type)
+            const toolDisplayName = getToolDisplayName(toolCall.type)
+            const fileDisplayName = toolCall.fileName ? toolCall.fileName.trim() : ''
+
+            // Create inline tool call element
+            const inlineToolCall = `<span class=\"inline-tool-call ${toolCall.type.toLowerCase().includes('failed') || toolCall.type.toLowerCase().includes('error') ? 'error' : 'success'}\">\
+              <span class="tool-icon">${toolIcon}</span>
+              <span class="tool-text">${toolDisplayName}${fileDisplayName ? ': ' + fileDisplayName : ''}</span>
+            </span><span class=\"inline-tool-break\"></span>`
+
+            // Replace the tool call marker with inline HTML
+            processedContent = processedContent.replace(toolCall.fullMatch, inlineToolCall)
           })
-          message.content = cleanContent.trim()
+          message.content = processedContent.trim()
         }
 
         return message
@@ -594,15 +606,7 @@ const formatTime = (timestamp: number) => {
   return new Date(timestamp).toLocaleTimeString()
 }
 
-// Get tool display name
-const getToolDisplayName = (toolType: string) => {
-  const displayNames = {
-    FILE_WRITE_SUCCESS: 'File written',
-    FILE_WRITE_FAILED: 'Write failed',
-    GENERATION_COMPLETE: 'Complete',
-  }
-  return displayNames[toolType as keyof typeof displayNames] || toolType
-}
+// Tool display names and icons are now dynamically imported from toolConfig - fully generic system
 
 // Streaming content buffer to handle partial tool calls
 const streamingBuffer = ref('')
@@ -614,9 +618,8 @@ const processStreamingContent = (newContent: string) => {
   let displayContent = ''
   const buffer = streamingBuffer.value
 
-  // Look for complete tool call patterns
-  const toolCallRegex =
-    /\[(FILE_WRITE_SUCCESS|FILE_WRITE_FAILED|GENERATION_COMPLETE)(?::([^\]]*))?\]/g
+  // Look for complete tool call patterns using dynamic regex
+  const toolCallRegex = generateToolCallRegex()
   let lastProcessedIndex = 0
   let match
 
@@ -632,10 +635,24 @@ const processStreamingContent = (newContent: string) => {
       fullMatch: fullMatch,
     }
 
-    // Add to pending tool calls
+    // Add to pending tool calls for tracking
     if (!pendingToolCalls.value.some((tc) => tc.fullMatch === fullMatch)) {
       pendingToolCalls.value.push(toolCall)
     }
+
+    // Convert tool call to inline HTML element
+    const toolIcon = getToolIcon(toolType)
+    const toolDisplayName = getToolDisplayName(toolType)
+    const fileDisplayName = fileName ? fileName.trim() : ''
+
+    // Create inline tool call element
+    const inlineToolCall = `<span class=\"inline-tool-call ${toolType.toLowerCase().includes('failed') || toolType.toLowerCase().includes('error') ? 'error' : 'success'}\">\
+      <span class="tool-icon">${toolIcon}</span>
+      <span class="tool-text">${toolDisplayName}${fileDisplayName ? ': ' + fileDisplayName : ''}</span>
+    </span><span class=\"inline-tool-break\"></span>`
+
+    // Add inline tool call to display content
+    displayContent += inlineToolCall
 
     lastProcessedIndex = match.index + fullMatch.length
   }
@@ -660,8 +677,7 @@ const processStreamingContent = (newContent: string) => {
 // Simple tool call parsing for history messages
 const parseHistoryToolCalls = (content: string): ToolCall[] => {
   const toolCalls: ToolCall[] = []
-  const toolCallRegex =
-    /\[(FILE_WRITE_SUCCESS|FILE_WRITE_FAILED|GENERATION_COMPLETE)(?::([^\]]*))?\]/g
+  const toolCallRegex = generateToolCallRegex()
   let match
 
   while ((match = toolCallRegex.exec(content)) !== null) {
@@ -678,9 +694,13 @@ const parseHistoryToolCalls = (content: string): ToolCall[] => {
 
 // Load app on mount
 
-onMounted(() => {
+onMounted(async () => {
   // 确保初始状态下没有选中的元素
   selectedElementInfo.value = null
+
+  // Initialize tool configuration (async loading from backend)
+  await initToolsConfig()
+
   loadApp()
   chatContainer.value?.addEventListener('scroll', debouncedHandleHistoryScroll)
   window.addEventListener('beforeunload', saveChatState)
@@ -739,7 +759,7 @@ const handleEnterKey = (event: KeyboardEvent) => {
 
           <!-- Initial Welcome Message -->
           <div v-if="messages.length === 0 && !isGenerating" class="welcome-message">
-            <div class="w-14 h-14 rounded-full overflow-hidden border">
+            <div class="w-20 h-20 rounded-full overflow-hidden border">
               <img
                 :src="app.data?.cover || '/logo.png'"
                 alt="cover"
@@ -785,62 +805,7 @@ const handleEnterKey = (event: KeyboardEvent) => {
                 </span>
               </div>
 
-              <!-- Tool Calls Display -->
-              <div
-                v-if="
-                  message.role === 'assistant' && message.toolCalls && message.toolCalls.length > 0
-                "
-                class="inline-tool-calls"
-              >
-                <div
-                  v-for="(toolCall, idx) in message.toolCalls"
-                  :key="idx"
-                  class="inline-tool-item"
-                >
-                  <svg
-                    v-if="toolCall.type === 'FILE_WRITE_SUCCESS'"
-                    xmlns="http://www.w3.org/2000/svg"
-                    viewBox="0 0 24 24"
-                    width="12"
-                    height="12"
-                    fill="currentColor"
-                    class="inline-tool-icon success"
-                  >
-                    <path
-                      d="M9,20.42L2.79,14.21L5.62,11.38L9,14.77L18.88,4.88L21.71,7.71L9,20.42Z"
-                    />
-                  </svg>
-                  <svg
-                    v-else-if="toolCall.type === 'FILE_WRITE_FAILED'"
-                    xmlns="http://www.w3.org/2000/svg"
-                    viewBox="0 0 24 24"
-                    width="12"
-                    height="12"
-                    fill="currentColor"
-                    class="inline-tool-icon error"
-                  >
-                    <path
-                      d="M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z"
-                    />
-                  </svg>
-                  <svg
-                    v-else
-                    xmlns="http://www.w3.org/2000/svg"
-                    viewBox="0 0 24 24"
-                    width="12"
-                    height="12"
-                    fill="currentColor"
-                    class="inline-tool-icon complete"
-                  >
-                    <path
-                      d="M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M12,17A5,5 0 0,1 7,12A5,5 0 0,1 12,7A5,5 0 0,1 17,12A5,5 0 0,1 12,17Z"
-                    />
-                  </svg>
-                  <span class="inline-tool-text">{{
-                    toolCall.fileName || getToolDisplayName(toolCall.type)
-                  }}</span>
-                </div>
-              </div>
+              <!-- Tool Calls Display removed -->
 
               <div class="message-time">{{ formatTime(message.timestamp) }}</div>
             </div>
@@ -1157,6 +1122,55 @@ const handleEnterKey = (event: KeyboardEvent) => {
   line-height: 1.7;
   white-space: pre-wrap;
   word-wrap: break-word;
+}
+
+/* 减少段落间距，让排版更紧凑 */
+:deep(.message-text p) {
+  margin: 0.2em 0; /* 减少段落间距 */
+}
+
+:deep(.message-text p:first-child) {
+  margin-top: 0;
+}
+
+:deep(.message-text p:last-child) {
+  margin-bottom: 0;
+}
+
+/* 隐藏空段落，避免多余空行 */
+:deep(.message-text p:empty) {
+  display: none;
+}
+
+/* 更保守的空白段落处理 - 只处理明确的空段落 */
+
+/* 历史消息中，markdown 段落包裹的工具调用标签去掉额外间距并限制宽度 */
+:deep(.message-text p:has(.inline-tool-call)) {
+  margin: 0; /* 不要额外段落间距 */
+}
+
+/* 限制历史消息里标签宽度并截断过长文本 */
+:deep(.message-text .inline-tool-call) {
+  max-width: 100%;
+}
+
+:deep(.message-text .inline-tool-call .tool-text) {
+  max-width: 200px; /* 放宽宽度限制，提供更多显示空间 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 强制工具调用标签后换行（历史+流式均适用） */
+:deep(.message-text .inline-tool-break) {
+  display: block;
+  height: 4px; /* 增加换行间距，提供呼吸感 */
+}
+
+/* 包含工具标签的段落适当调整行高，提供呼吸感 */
+:deep(.message-text p:has(.inline-tool-call)) {
+  line-height: 1.6;
+  margin: 4px 0; /* 增加段落间距 */
 }
 
 .message-text.has-file-list-above {
@@ -1886,6 +1900,85 @@ const handleEnterKey = (event: KeyboardEvent) => {
   100% {
     opacity: 1;
     transform: translateY(0);
+  }
+}
+
+/* 工具调用 chip：使用 inline-flex 实现更精确的对齐 */
+:deep(.message-content .message-text .inline-tool-call),
+:deep(.message-text .inline-tool-call),
+:deep(.inline-tool-call) {
+  display: inline-flex !important;
+  align-items: center;
+  justify-content: center;
+  height: 22px; /* 增加高度以适应更大的文字 */
+  padding: 0 6px; /* 增加内边距 */
+  margin: 2px 4px; /* 增加外边距，提供呼吸感 */
+  border-radius: 11px; /* 相应增加圆角 */
+  gap: 3px; /* 增加间距 */
+  font-size: 13px; /* 接近正文大小但稍小 */
+  line-height: 1;
+  vertical-align: middle;
+  box-sizing: border-box;
+  white-space: nowrap;
+}
+
+:deep(.inline-tool-call.success) {
+  background: rgba(16, 185, 129, 0.1);
+  border: 1px solid rgba(16, 185, 129, 0.2);
+  color: #065f46;
+}
+
+:deep(.inline-tool-call.error) {
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.2);
+  color: #991b1b;
+}
+
+:deep(.inline-tool-call .tool-icon) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+}
+
+:deep(.inline-tool-call .tool-icon svg) {
+  width: 10px;
+  height: 10px;
+  display: block;
+}
+
+:deep(.inline-tool-call .tool-text) {
+  font-family: 'Monaco', 'Consolas', monospace;
+  font-size: 13px !important;
+  font-weight: 500;
+  white-space: nowrap;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+/* 成功状态的图标颜色 */
+:deep(.inline-tool-call.success .tool-icon) {
+  color: #22c55e;
+}
+
+/* 错误状态的图标颜色 */
+:deep(.inline-tool-call.error .tool-icon) {
+  color: #ef4444;
+}
+
+@keyframes tool-fade-in {
+  0% {
+    opacity: 0;
+    transform: scale(0.8) translateX(-4px);
+  }
+  60% {
+    transform: scale(1.05) translateX(0);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1) translateX(0);
   }
 }
 

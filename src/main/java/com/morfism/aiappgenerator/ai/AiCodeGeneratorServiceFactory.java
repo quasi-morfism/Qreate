@@ -2,7 +2,7 @@ package com.morfism.aiappgenerator.ai;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
-import com.morfism.aiappgenerator.ai.tools.FileWriteTool;
+import com.morfism.aiappgenerator.ai.tools.*;
 import com.morfism.aiappgenerator.exception.BusinessException;
 import com.morfism.aiappgenerator.exception.ErrorCode;
 import com.morfism.aiappgenerator.model.enums.CodeGenTypeEnum;
@@ -146,6 +146,9 @@ public class AiCodeGeneratorServiceFactory {
     private Boolean deepseekReasoningLogResponses;
     @Autowired
     private ChatHistoryService chatHistoryService;
+
+    @Autowired
+    private ToolManager toolManager;
 
     /**
      * Provide a default Bean
@@ -302,7 +305,7 @@ public class AiCodeGeneratorServiceFactory {
             case VUE_PROJECT -> AiServices.builder(AiCodeGeneratorService.class)
                     .streamingChatModel(streamingChatModel)
                     .chatMemoryProvider(memoryId -> chatMemory)
-                    .tools(new FileWriteTool())
+                    .tools((Object[]) toolManager.getAllTools())
                     .hallucinatedToolNameStrategy(toolExecutionRequest -> ToolExecutionResultMessage.from(
                         toolExecutionRequest, "Error: there is no tool called " + toolExecutionRequest.name()
                     ))

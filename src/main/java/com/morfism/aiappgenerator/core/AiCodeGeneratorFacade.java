@@ -6,6 +6,7 @@ import com.morfism.aiappgenerator.ai.AiCodeGeneratorService;
 //import com.morfism.aiappgenerator.ai.model.MultiFileCodeResult;
 
 import com.morfism.aiappgenerator.ai.AiCodeGeneratorServiceFactory;
+import com.morfism.aiappgenerator.ai.tools.ToolExecutionHandler;
 import com.morfism.aiappgenerator.constant.AppConstant;
 import com.morfism.aiappgenerator.core.builder.VueProjectBuilder;
 import com.morfism.aiappgenerator.core.parser.CodeParserExecutor;
@@ -14,7 +15,6 @@ import com.morfism.aiappgenerator.exception.BusinessException;
 import com.morfism.aiappgenerator.exception.ErrorCode;
 import com.morfism.aiappgenerator.model.enums.CodeGenTypeEnum;
 import com.morfism.aiappgenerator.service.ChatHistoryService;
-import dev.langchain4j.agent.tool.ToolExecutionRequest;
 import dev.langchain4j.service.TokenStream;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
@@ -45,6 +45,9 @@ public class AiCodeGeneratorFacade {
 
     @Resource
     private VueProjectBuilder vueProjectBuilder;
+
+    @Resource
+    private ToolExecutionHandler toolExecutionHandler;
 
 //    /**
 //     * 统一代码生成入口：根据类型生成并保存代码（同步模式）
@@ -239,41 +242,8 @@ public class AiCodeGeneratorFacade {
                         }
                     })
                     .onToolExecuted(toolExecution -> {
-                        // 精确的工具执行回调 - 即使前端断开也会执行
-                        ToolExecutionRequest request = toolExecution.request();
-                        String toolName = request.name();
-                        String result = toolExecution.result();
-                        
-                        log.info("🛠️ Tool executed: {} (id: {}) for appId: {}", toolName, request.id(), appId);
-                        
-                        if ("writeFile".equals(toolName)) {
-                            try {
-                                String arguments = request.arguments();
-                                String fileName = extractFileNameFromArguments(arguments);
-                                
-                                if (result != null && !result.contains("error") && !result.contains("failed")) {
-                                    log.info("✅ File write completed: {} for appId: {}", fileName, appId);
-                                    String successMarker = "\n[FILE_WRITE_SUCCESS:" + fileName + "]";
-                                    responseBuilder.append(successMarker);
-                                    log.info("📝 Added FILE_WRITE_SUCCESS marker to responseBuilder: {}", successMarker);
-                                    sink.next(successMarker);
-                                } else {
-                                    log.warn("❌ File write failed: {} for appId: {}", fileName, appId);
-                                    String failedMarker = "\n[FILE_WRITE_FAILED:" + fileName + "]";
-                                    responseBuilder.append(failedMarker);
-                                    log.info("📝 Added FILE_WRITE_FAILED marker to responseBuilder: {}", failedMarker);
-                                    sink.next(failedMarker);
-                                }
-                            } catch (Exception e) {
-                                log.warn("❌ Error processing writeFile tool execution: {}", e.getMessage());
-                                String errorMarker = "\n[FILE_WRITE_ERROR]";
-                                responseBuilder.append(errorMarker);
-                                sink.next(errorMarker);
-                            }
-                        }
-                        
-                        // 注释掉工具执行ID的显示，避免前端显示乱七八糟的ID
-                        // sink.next("\n[TOOL_EXECUTED:" + toolName + ":" + request.id() + "]");
+                        // 使用工具执行处理器统一处理所有工具
+                        toolExecutionHandler.handleToolExecution(toolExecution, responseBuilder, sink, appId);
                     })
                     .onCompleteResponse(completeResponse -> {
                         log.info("🎉 Vue project generation completed for appId: {}", appId);
@@ -330,56 +300,6 @@ public class AiCodeGeneratorFacade {
 
 
 
-    /**
-     * 从工具参数中提取文件名
-     * Extract file name from tool arguments
-     *
-     * @param arguments 工具调用参数JSON字符串/tool arguments JSON string
-     * @return 文件名/file name
-     */
-    private String extractFileNameFromArguments(String arguments) {
-        try {
-            // 工具参数通常是JSON格式，尝试提取relativeFilePath、fileName或path字段
-            if (arguments != null) {
-                // 查找relativeFilePath字段（Vue项目工具使用的字段名）
-                if (arguments.contains("\"relativeFilePath\"")) {
-                    int start = arguments.indexOf("\"relativeFilePath\"") + 19; // "relativeFilePath": 的长度
-                    int valueStart = arguments.indexOf("\"", start) + 1;
-                    int valueEnd = arguments.indexOf("\"", valueStart);
-                    if (valueStart > 0 && valueEnd > valueStart) {
-                        String fullPath = arguments.substring(valueStart, valueEnd);
-                        // 只返回文件名部分
-                        int lastSlash = fullPath.lastIndexOf('/');
-                        return lastSlash != -1 ? fullPath.substring(lastSlash + 1) : fullPath;
-                    }
-                }
-                // 查找fileName字段
-                if (arguments.contains("\"fileName\"")) {
-                    int start = arguments.indexOf("\"fileName\"") + 12; // "fileName": 的长度
-                    int valueStart = arguments.indexOf("\"", start) + 1;
-                    int valueEnd = arguments.indexOf("\"", valueStart);
-                    if (valueStart > 0 && valueEnd > valueStart) {
-                        return arguments.substring(valueStart, valueEnd);
-                    }
-                }
-                // 查找path字段
-                if (arguments.contains("\"path\"")) {
-                    int start = arguments.indexOf("\"path\"") + 8; // "path": 的长度
-                    int valueStart = arguments.indexOf("\"", start) + 1;
-                    int valueEnd = arguments.indexOf("\"", valueStart);
-                    if (valueStart > 0 && valueEnd > valueStart) {
-                        String fullPath = arguments.substring(valueStart, valueEnd);
-                        // 只返回文件名部分
-                        int lastSlash = fullPath.lastIndexOf('/');
-                        return lastSlash != -1 ? fullPath.substring(lastSlash + 1) : fullPath;
-                    }
-                }
-            }
-        } catch (Exception e) {
-            log.debug("Failed to extract file name from arguments: {}", e.getMessage());
-        }
-        return "unknown file";
-    }
 
 
 
